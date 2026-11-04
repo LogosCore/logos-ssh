@@ -1,0 +1,55 @@
+# Local development stack for logos-ssh: the SSH channel and the SSH factory,
+# one image. Joins logos-core's network to reach core and its RabbitMQ.
+# Start logos-core first (`make services` in logos-core), set
+# RABBITMQ_PASSWORD (core's RABBITMQ_DEFAULT_PASS) in .env, then:
+#
+#   docker compose up -d --build
+#
+# An SSH server on this machine is reached as host.docker.internal: add a
+# target with that host.
+x-rabbitmq: &rabbitmq
+  RABBITMQ_HOST: ${RABBITMQ_HOST:-logos-rabbitmq}
+  RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+  RABBITMQ_USER: ${RABBITMQ_USER:-logos}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+  RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
+
+services:
+  ssh-channel:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    image: logos-ssh:dev
+    container_name: logos-ssh-channel
+    restart: unless-stopped
+    entrypoint: ["/app/ssh-channel"]
+    environment:
+      <<: *rabbitmq
+      CHANNEL_ID: ${CHANNEL_ID:-ssh-local}
+      LOGOS_CORE_BASE_URL: ${LOGOS_CORE_BASE_URL:-http://logos-core-dev:8002}
+      MAX_CONNECTIONS: ${MAX_CONNECTIONS:-1000}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks:
+      - logos
+
+  ssh-factory:
+    image: logos-ssh:dev
+    container_name: logos-ssh-factory
+    restart: unless-stopped
+    depends_on:
+      - ssh-channel
+    entrypoint: ["/app/ssh-factory"]
+    environment:
+      <<: *rabbitmq
+      FACTORY_ID: ${FACTORY_ID:-ssh-factory-local}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    networks:
+      - logos
+
+networks:
+  logos:
+    external: true
+    name: logos-core_logos

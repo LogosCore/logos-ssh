@@ -1,0 +1,222 @@
+// Package agent is the SSH channel acting as the minion of the servers it
+// reaches (docs: contracts/agentless-channels/). Core's calls (bind-call)
+// are answered by the minion's Caller, the server's login kept a while for
+// the next call; core's opens (bind-persistent) get a connection socket to
+// core on one side, the server's SSH connection on the other, and the
+// minion's Runner between them. Core's messages come unsealed (the SSH
+// factory's builds declare protocol.CryptoNone), and so do the minion's.
+package agent
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/logoscore/logos-golang-channel-core/v3/pkg/connclient"
+	"github.com/logoscore/logos-golang-channel-core/v3/pkg/linkclient"
+	"github.com/logoscore/logos-golang-protocol/protocol"
+	"github.com/logoscore/logos-ssh/internal/connection"
+	"github.com/logoscore/logos-ssh/internal/minion"
+	"github.com/logoscore/logos-ssh/internal/ops"
+	"github.com/logoscore/logos-ssh/internal/sshconn"
+	"github.com/logoscore/logos-ssh/internal/sshhost"
+)
+
+// Stats are the channel's counters.
+type Stats struct {
+	Calls, CallsFailed, Opens, OpensFailed, Open, LoginsKept int64
+	Draining, LinkUp                                         bool
+}
+
+// Agent answers calls and opens connections.
+type Agent struct {
+	coreURL, instance string
+	max               int
+	pool              *sshconn.Pool
+
+	draining    atomic.Bool
+	linkUp      atomic.Bool
+	calls       atomic.Int64
+	callsFailed atomic.Int64
+	opens       atomic.Int64
+	opensFailed atomic.Int64
+
+	mu       sync.Mutex
+	sessions map[*session]struct{}
+}
+
+// New is an agent for instance, opening connection sockets under core's
+// base URL, at most max persistent connections at once.
+func New(coreURL, instance string, max int) *Agent {
+	return &Agent{coreURL: coreURL, instance: instance, max: max, pool: sshconn.NewPool(), sessions: map[*session]struct{}{}}
+}
+
+// SetDraining refuses (true) or takes again new calls and opens; open
+// connections stay.
+func (a *Agent) SetDraining(v bool) { a.draining.Store(v) }
+
+// Draining reports whether calls and opens are refused.
+func (a *Agent) Draining() bool { return a.draining.Load() }
+
+// SetLinkUp records the control link's state (linkclient's OnState).
+func (a *Agent) SetLinkUp(up bool) { a.linkUp.Store(up) }
+
+// Stats are the counters now.
+func (a *Agent) Stats() Stats {
+	a.mu.Lock()
+	open := int64(len(a.sessions))
+	a.mu.Unlock()
+	return Stats{Calls: a.calls.Load(), CallsFailed: a.callsFailed.Load(), Opens: a.opens.Load(), OpensFailed: a.opensFailed.Load(),
+		Open: open, LoginsKept: int64(a.pool.Idle()), Draining: a.draining.Load(), LinkUp: a.linkUp.Load()}
+}
+
+// CloseAll closes every persistent connection, and every login a call
+// kept: their sockets to core close with them. It returns how many
+// connections.
+func (a *Agent) CloseAll(why string) int {
+	a.mu.Lock()
+	all := make([]*session, 0, len(a.sessions))
+	for s := range a.sessions {
+		all = append(all, s)
+	}
+	a.mu.Unlock()
+	for _, s := range all {
+		s.close(why)
+	}
+	a.pool.CloseIdle()
+	return len(all)
+}
+
+// Close closes every connection and stops the pool: the channel is
+// stopping.
+func (a *Agent) Close(why string) {
+	a.CloseAll(why)
+	a.pool.Close()
+}
+
+// logf is the minion's log, at debug: what it does with each task.
+func logf(addr string) func(format string, args ...any) {
+	return func(format string, args ...any) {
+		slog.Debug(fmt.Sprintf(format, args...), "server", addr)
+	}
+}
+
+// Call answers one of core's calls: the control link's handler.
+func (a *Agent) Call(ctx context.Context, call linkclient.Call) linkclient.Answer {
+	a.calls.Add(1)
+	start := time.Now()
+	ans := a.call(ctx, call)
+	outcome, level := "answered", slog.LevelDebug
+	switch {
+	case ans.Failure != nil:
+		a.callsFailed.Add(1)
+		outcome, level = protocol.LinkFailName(ans.Failure.Kind), slog.LevelInfo
+	case ans.ID == nil:
+		a.callsFailed.Add(1)
+		outcome, level = "not_the_minion", slog.LevelInfo
+	}
+	args := []any{"request", call.Request, "host", call.Values["host"], "outcome", outcome, "duration_ms", time.Since(start).Milliseconds()}
+	if ans.Failure != nil {
+		args = append(args, "err", ans.Failure.Msg)
+	}
+	slog.Log(ctx, level, "call", args...)
+	return ans
+}
+
+func (a *Agent) call(ctx context.Context, call linkclient.Call) linkclient.Answer {
+	if a.Draining() {
+		return linkclient.Fail(protocol.LinkFailOther, "the channel is draining")
+	}
+	t, err := connection.ReadTarget(call.Values)
+	if err != nil {
+		return linkclient.Fail(protocol.LinkFailOther, "%s", err)
+	}
+	msg, err := minion.ReadCore(call.Data)
+	if err != nil {
+		return linkclient.Fail(protocol.LinkFailOther, "%s (a build of the SSH factory sends its messages unsealed)", err)
+	}
+	c, err := a.pool.Get(ctx, t)
+	if err != nil {
+		return sshconn.CallFailure(ctx, err, "")
+	}
+	// The call lives as long as its context: core's deadline, or the link.
+	// Ending it closes the connection, so whatever waits on the server gives
+	// up: a server gone quiet never holds the call, nor the link with it
+	// (the link opens again only once its calls returned).
+	watch := context.AfterFunc(ctx, func() { _ = c.Close() })
+	host := sshhost.New(c)
+	caller := &minion.Caller{Host: host, Ops: ops.Commands, MaxTasks: ops.MaxTasks, Hello: host.Hello, Logf: logf(t.Addr)}
+	items := caller.Answer(ctx, msg)
+	reply, err := minion.Reply(msg.ID, items)
+	intact := watch() // false: the call's context ended, and closed the connection
+	if !intact {
+		slog.Info("call outlived its context: its connection closed", "request", call.Request, "host", call.Values["host"],
+			"why", context.Cause(ctx))
+	}
+	if err != nil {
+		a.pool.Put(t, c, false)
+		return linkclient.Fail(protocol.LinkFailOther, "the answer does not encode: %s", err)
+	}
+	a.pool.Put(t, c, intact)
+	id := call.ID
+	return linkclient.Answer{ID: &id, Data: reply, Peer: c.Peer}
+}
+
+// maxFrame bounds a connection socket's frame: an id and the largest
+// message, with room to spare.
+const maxFrame = protocol.MaxMinionMessageSize + 64<<10
+
+// Open opens a persistent connection core asked for: the control link's
+// Opener. It logs in to the server, opens the connection's socket to core
+// naming the open, and runs the minion between them on its own.
+func (a *Agent) Open(ctx context.Context, o linkclient.Open) linkclient.Answer {
+	ans := a.open(ctx, o)
+	if ans.Failure != nil {
+		a.opensFailed.Add(1)
+		slog.Info("open failed", "request", o.Request, "host", o.Values["host"], "kind", protocol.LinkFailName(ans.Failure.Kind), "err", ans.Failure.Msg)
+	} else {
+		a.opens.Add(1)
+	}
+	return ans
+}
+
+func (a *Agent) open(ctx context.Context, o linkclient.Open) linkclient.Answer {
+	if a.Draining() {
+		return linkclient.Fail(protocol.LinkFailOther, "the channel is draining")
+	}
+	a.mu.Lock()
+	full := len(a.sessions) >= a.max
+	a.mu.Unlock()
+	if full {
+		return linkclient.Fail(protocol.LinkFailOther, "the channel has %d connections open, its most", a.max)
+	}
+	t, err := connection.ReadTarget(o.Values)
+	if err != nil {
+		return linkclient.Fail(protocol.LinkFailOther, "%s", err)
+	}
+	c, err := sshconn.Dial(ctx, t)
+	if err != nil {
+		return sshconn.Failure(ctx, err)
+	}
+	core, err := connclient.Dial(ctx, connclient.Options{BaseURL: a.coreURL, Instance: a.instance,
+		Kind: protocol.KindBindPersistent, OpenRequest: o.Request, Peer: c.Peer, MaxFrame: maxFrame})
+	if err != nil {
+		_ = c.Close()
+		return linkclient.Fail(protocol.LinkFailOther, "core did not take the connection's socket: %s", err)
+	}
+	s := newSession(t, c, core, o.Request)
+	a.mu.Lock()
+	a.sessions[s] = struct{}{}
+	a.mu.Unlock()
+	go func() {
+		s.run()
+		a.mu.Lock()
+		delete(a.sessions, s)
+		a.mu.Unlock()
+	}()
+	slog.Info("connection open", "request", o.Request, "server", t.Addr, "user", t.User, "host_key", c.Fingerprint())
+	return linkclient.Answer{}
+}

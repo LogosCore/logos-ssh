@@ -1,0 +1,7 @@
+# The image builds from go.mod alone: local workspaces, settings stay out.
+.git
+go.work
+go.work.sum
+.env
+.dev-bin
+docker-compose.override.yml

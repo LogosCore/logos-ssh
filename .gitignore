@@ -1,0 +1,7 @@
+# Local runtime configuration
+.env
+
+# Compiled binaries
+/ssh-channel
+/ssh-factory
+.dev-bin/
