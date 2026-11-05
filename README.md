@@ -31,7 +31,9 @@ Two programs, one image:
   open session's, else the build's: the minion keeps no ids of its own).
   From then on it runs core's tasks as they come, up to 4 at once. The connection lives as long as
   both the socket and the SSH connection; a keepalive finds a server gone
-  quiet.
+  quiet. Its commands run inside the SSH connection and go with it: back
+  over a new one, core's `reack` (which tasks it still has) gets
+  `unknown_task` for each of them, and core ends them.
 - **What came of it** decides the target's state: nothing reached
   (unreachable, timeout), something that is not an SSH server (what it sent,
   for a call), a host key other than the one given (failure `host_key`), a

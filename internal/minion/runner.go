@@ -415,6 +415,16 @@ func (r *Runner) Take(answer protocol.CoreMessage, sent []any) {
 				continue
 			}
 			r.stop(c.Task, i)
+		case protocol.ItemReack:
+			// Core asks which of these tasks the minion still has: back over
+			// a new connection, it has none of those that ran in the one
+			// that went.
+			var rk protocol.ReackItem
+			if protocol.UnmarshalCBOR(raw, &rk) != nil || rk.Validate() != nil {
+				r.queueErr(protocol.ErrItemBadMessage, "the reack does not read", i)
+				continue
+			}
+			r.reack(rk.Tasks, i)
 		case protocol.ItemPoll:
 			// Come back sooner than the schedule: a stream of the minion's
 			// may go on any moment.
@@ -574,6 +584,24 @@ func (r *Runner) start(ti protocol.TaskItem) {
 		}
 		r.Nudge()
 	}()
+}
+
+// reack answers core's question about tasks (item, a reack): an ack names
+// those the runner has (running, or ended with an end core has not had),
+// an unknown_task each it does not, which core ends. A runner lives as
+// long as its connection: a command that ran in an earlier one went with
+// it.
+func (r *Runner) reack(ids [][]byte, item int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range ids {
+		if slices.ContainsFunc(r.tasks, func(t *Task) bool { return slices.Equal(t.id, id) }) {
+			r.acks = append(r.acks, id)
+			continue
+		}
+		r.errs = append(r.errs, protocol.ErrItem{T: protocol.ItemErr, Code: protocol.ErrItemUnknownTask,
+			Msg: "no such task: it ran in a connection that closed", Item: &item, Task: id})
+	}
 }
 
 // stop cancels a running task; one the runner does not have gets an
