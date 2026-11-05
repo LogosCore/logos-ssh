@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/logoscore/logos-golang-protocol/protocol"
 	"github.com/logoscore/logos-ssh/internal/connection"
 )
 
@@ -33,8 +34,9 @@ func NewPool() *Pool {
 }
 
 // Get is a connection to t's server, logged in: the one a call before kept,
-// while it still answers, or a new one.
-func (p *Pool) Get(ctx context.Context, t connection.Target) (*Conn, error) {
+// while it still answers, or a new one, with how its logins fared (none for
+// one kept: nothing was tried).
+func (p *Pool) Get(ctx context.Context, t connection.Target) (*Conn, []protocol.LinkLogin, error) {
 	key := keyOf(t)
 	p.mu.Lock()
 	ic, ok := p.idle[key]
@@ -42,7 +44,7 @@ func (p *Pool) Get(ctx context.Context, t connection.Target) (*Conn, error) {
 	p.mu.Unlock()
 	if ok {
 		if time.Now().Before(ic.until) && ic.c.Alive(2*time.Second) {
-			return ic.c, nil
+			return ic.c, nil, nil
 		}
 		_ = ic.c.Close() // gone quiet: a new one instead
 	}
@@ -119,7 +121,11 @@ func (p *Pool) reap() {
 // only to the same server, as the same user, with the same credentials.
 func keyOf(t connection.Target) string {
 	h := sha256.New()
-	for _, s := range []string{t.Addr, t.User, t.Password, t.PrivateKey, t.Passphrase, t.HostKey, proxyOf(t)} {
+	parts := []string{t.Addr, t.User, t.HostKey, proxyOf(t)}
+	for _, l := range t.Logins {
+		parts = append(parts, l.Credential, l.User, l.Password, l.PrivateKey, l.Passphrase)
+	}
+	for _, s := range parts {
 		h.Write([]byte(s))
 		h.Write([]byte{0})
 	}

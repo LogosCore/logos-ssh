@@ -149,7 +149,7 @@ func (a *Agent) call(ctx context.Context, call linkclient.Call) linkclient.Answe
 	if a.Draining() {
 		return linkclient.Fail(protocol.LinkFailOther, "the channel is draining")
 	}
-	t, err := connection.ReadTarget(call.Values)
+	t, err := connection.ReadTarget(call.Values, call.Credentials)
 	if err != nil {
 		return linkclient.Fail(protocol.LinkFailOther, "%s", err)
 	}
@@ -164,9 +164,11 @@ func (a *Agent) call(ctx context.Context, call linkclient.Call) linkclient.Answe
 	if err != nil {
 		return linkclient.Fail(protocol.LinkFailOther, "%s", err)
 	}
-	c, err := a.pool.Get(ctx, t)
+	c, logins, err := a.pool.Get(ctx, t)
 	if err != nil {
-		return sshconn.CallFailure(ctx, err, "")
+		ans := sshconn.CallFailure(ctx, err, "")
+		ans.Logins = logins
+		return ans
 	}
 	// The call lives as long as its context: core's deadline, or the link.
 	// Ending it closes the connection, so whatever waits on the server gives
@@ -184,15 +186,19 @@ func (a *Agent) call(ctx context.Context, call linkclient.Call) linkclient.Answe
 	}
 	if err != nil {
 		a.pool.Put(t, c, false)
-		return linkclient.Fail(protocol.LinkFailOther, "the answer does not encode: %s", err)
+		ans := linkclient.Fail(protocol.LinkFailOther, "the answer does not encode: %s", err)
+		ans.Logins = logins
+		return ans
 	}
 	a.pool.Put(t, c, intact)
 	sealed, err := protocol.SealFrame(call.Keys.Material, call.ID, protocol.FrameMinionToCore, reply)
 	if err != nil {
-		return linkclient.Fail(protocol.LinkFailOther, "the answer does not seal: %s", err)
+		ans := linkclient.Fail(protocol.LinkFailOther, "the answer does not seal: %s", err)
+		ans.Logins = logins
+		return ans
 	}
 	id := call.ID
-	return linkclient.Answer{ID: &id, Data: sealed, Peer: c.Peer}
+	return linkclient.Answer{ID: &id, Data: sealed, Peer: c.Peer, Logins: logins}
 }
 
 // maxFrame bounds a connection socket's frame: an id and the largest
@@ -223,7 +229,7 @@ func (a *Agent) open(ctx context.Context, o linkclient.Open) linkclient.Answer {
 	if full {
 		return linkclient.Fail(protocol.LinkFailOther, "the channel has %d connections open, its most", a.max)
 	}
-	t, err := connection.ReadTarget(o.Values)
+	t, err := connection.ReadTarget(o.Values, o.Credentials)
 	if err != nil {
 		return linkclient.Fail(protocol.LinkFailOther, "%s", err)
 	}
@@ -232,15 +238,20 @@ func (a *Agent) open(ctx context.Context, o linkclient.Open) linkclient.Answer {
 		// gives, sealed with that id's keys.
 		return linkclient.Fail(protocol.LinkFailOther, "core's open says no id to speak under, or not its keys: a core older than this channel")
 	}
-	c, err := sshconn.Dial(ctx, t)
+	c, logins, err := sshconn.Dial(ctx, t)
 	if err != nil {
-		return sshconn.Failure(ctx, err)
+		ans := sshconn.Failure(ctx, err)
+		ans.Logins = logins
+		return ans
 	}
 	core, err := connclient.Dial(ctx, connclient.Options{BaseURL: a.coreURL, Instance: a.instance,
 		Kind: protocol.KindBindPersistent, OpenRequest: o.Request, Peer: c.Peer, MaxFrame: maxFrame})
 	if err != nil {
 		_ = c.Close()
-		return linkclient.Fail(protocol.LinkFailOther, "core did not take the connection's socket: %s", err)
+		// The login worked all the same: core is told which.
+		ans := linkclient.Fail(protocol.LinkFailOther, "core did not take the connection's socket: %s", err)
+		ans.Logins = logins
+		return ans
 	}
 	s := newSession(t, c, core, o.Request, append([]byte(nil), o.Under[:]...), o.Keys.Material)
 	a.mu.Lock()
@@ -252,6 +263,6 @@ func (a *Agent) open(ctx context.Context, o linkclient.Open) linkclient.Answer {
 		delete(a.sessions, s)
 		a.mu.Unlock()
 	}()
-	slog.Info("connection open", "request", o.Request, "server", t.Addr, "user", t.User, "host_key", c.Fingerprint())
-	return linkclient.Answer{}
+	slog.Info("connection open", "request", o.Request, "server", t.Addr, "user", c.User, "host_key", c.Fingerprint())
+	return linkclient.Answer{Logins: logins}
 }

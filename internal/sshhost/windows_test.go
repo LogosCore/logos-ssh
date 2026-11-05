@@ -265,11 +265,11 @@ func (w *fakeWindows) dirOf(command string, out io.Writer) int {
 func winHost(t *testing.T, w *fakeWindows) (*Host, *sshtest.Server) {
 	t.Helper()
 	srv := sshtest.NewWindows(t, w.dir, w.exec)
-	tg, err := connection.ReadTarget(srv.Values())
+	tg, err := connection.ReadTarget(srv.Values(), srv.Credentials())
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := sshconn.Dial(context.Background(), tg)
+	c, _, err := sshconn.Dial(context.Background(), tg)
 	if err != nil {
 		t.Fatal(err)
 	}

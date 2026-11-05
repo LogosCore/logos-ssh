@@ -12,6 +12,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"github.com/logoscore/logos-golang-protocol/protocol"
 	"io"
 	"net"
 	"os/exec"
@@ -123,9 +124,25 @@ func (s *Server) Host() string { return "127.0.0.1" }
 
 func (s *Server) Port() int { return s.ln.Addr().(*net.TCPAddr).Port }
 
-// Values are a target's values for the server, logging in by password.
+// PasswordID is the id of the server's password's credential.
+const PasswordID = "pw-1"
+
+// Values are a target's values for the server, logging in by its password:
+// the credential Credentials gives under PasswordID.
 func (s *Server) Values() map[string]any {
-	return map[string]any{"host": s.Host(), "port": uint64(s.Port()), "user": s.User, "password": s.Password} //nolint:gosec // a port
+	return map[string]any{"host": s.Host(), "port": uint64(s.Port()), "credentials": []any{PasswordID}} //nolint:gosec // a port
+}
+
+// Credentials are what core gives beside Values: the server's user and
+// password, a PLAINTEXT credential.
+func (s *Server) Credentials() map[string]protocol.Credential {
+	return map[string]protocol.Credential{PasswordID: s.PasswordCredential(PasswordID, s.Password)}
+}
+
+// PasswordCredential is a PLAINTEXT credential of the server's user, with
+// password.
+func (s *Server) PasswordCredential(id, password string) protocol.Credential {
+	return protocol.Credential{ID: id, Name: "test password", Type: protocol.CredentialTypePlaintext, Username: s.User, Password: password}
 }
 
 // Fingerprint is the server's host key's, as ssh-keygen -l prints it.

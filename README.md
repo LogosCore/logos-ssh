@@ -43,7 +43,7 @@ Two programs, one image:
 
 | Kind | Built-in (`fields`) | Each server (`target`) |
 |---|---|---|
-| `bind-call` | `call_reuse` (`30s`; `0s` logs in for every call) | `host`, `port` (22), `host_key` (`SHA256:…`; empty: the first one presented, shown on the session to pin), `user`, `password`, `private_key` (OpenSSH or PEM), `passphrase`, `proxy` (`socks5://`, `socks5h://`, `http://`), `connect_timeout` (10s) |
+| `bind-call` | `call_reuse` (`30s`; `0s` logs in for every call) | `host`, `port` (22), `host_key` (`SHA256:…`; empty: the first one presented, shown on the session to pin), `user` (for a credential without a username), `credentials` (required: the operation's `KEY` and `PLAINTEXT` credentials, up to 8, tried in order, a connection each, until one is taken; a password with a realm logs in as `username@realm`), `proxy` (`socks5://`, `socks5h://`, `http://`), `connect_timeout` (10s) |
 | `bind-persistent` | `keepalive` (`30s`) | the same |
 
 ## Commands

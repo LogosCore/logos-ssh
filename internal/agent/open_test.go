@@ -43,15 +43,15 @@ func TestOpenMinionSpeaksFirst(t *testing.T) {
 	defer core.Close()
 	a := New(core.URL, "ssh-test", 4)
 	defer a.Close("the test ends")
-	if ans := a.Open(context.Background(), linkclient.Open{Request: 6, Values: srv.Values(), Keys: testLinkKeys}); ans.Failure == nil ||
+	if ans := a.Open(context.Background(), linkclient.Open{Request: 6, Values: srv.Values(), Credentials: srv.Credentials(), Keys: testLinkKeys}); ans.Failure == nil ||
 		ans.Failure.Kind != protocol.LinkFailOther {
 		t.Fatalf("an open with no id: %+v", ans)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	ans := a.Open(ctx, linkclient.Open{Request: 7, Values: srv.Values(), Under: buildID, Keys: testLinkKeys})
+	ans := a.Open(ctx, linkclient.Open{Request: 7, Values: srv.Values(), Credentials: srv.Credentials(), Under: buildID, Keys: testLinkKeys})
 	cancel() // as the control link does once the open answered
-	if ans.Failure != nil {
-		t.Fatalf("open: %+v", ans.Failure)
+	if ans.Failure != nil || len(ans.Logins) != 1 || !ans.Logins[0].Accepted {
+		t.Fatalf("open: %+v, logins %+v", ans.Failure, ans.Logins)
 	}
 	select {
 	case f := <-got:

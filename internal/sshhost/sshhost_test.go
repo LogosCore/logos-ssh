@@ -27,11 +27,11 @@ import (
 func hostIn(t *testing.T, dir string) *Host {
 	t.Helper()
 	srv := sshtest.New(t, dir)
-	tg, err := connection.ReadTarget(srv.Values())
+	tg, err := connection.ReadTarget(srv.Values(), srv.Credentials())
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := sshconn.Dial(context.Background(), tg)
+	c, _, err := sshconn.Dial(context.Background(), tg)
 	if err != nil {
 		t.Fatal(err)
 	}

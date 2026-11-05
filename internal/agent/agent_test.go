@@ -167,9 +167,13 @@ func TestCall(t *testing.T) {
 	values["call_reuse"] = "1m"
 	buildID := [16]byte{1, 2, 3}
 	id, data := coreMessage(t, nil, protocol.RehelloItem{T: protocol.ItemRehello}, shellTask(7, "echo hi"))
-	ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: values, ID: buildID, Data: data})
+	ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: values, Credentials: srv.Credentials(), ID: buildID, Data: data})
 	if ans.Failure != nil || ans.ID == nil || *ans.ID != buildID || ans.Peer != "127.0.0.1" {
 		t.Fatalf("answer %+v", ans)
+	}
+	// Core is told which credential logged in.
+	if len(ans.Logins) != 1 || ans.Logins[0] != (protocol.LinkLogin{Credential: sshtest.PasswordID, Accepted: true}) {
+		t.Fatalf("logins %+v", ans.Logins)
 	}
 	m := minionMessage(t, ans.Data)
 	checkItems(t, m)
@@ -189,8 +193,9 @@ func TestCall(t *testing.T) {
 	download := protocol.TaskItem{T: protocol.ItemTask, Task: bytes.Repeat([]byte{9}, 16), Cmd: ops.Download,
 		Args: protocol.Args{minion.ArgDownloadPath: filepath.Join(dir, "f.txt")}}
 	_, data = coreMessage(t, nil, shellTask(8, "echo again"), download)
-	if ans = sealedCall(context.Background(), t, a, linkclient.Call{Request: 2, Values: values, ID: buildID, Data: data}); ans.ID == nil {
-		t.Fatalf("second answer %+v", ans)
+	if ans = sealedCall(context.Background(), t, a, linkclient.Call{Request: 2, Values: values, Credentials: srv.Credentials(), ID: buildID, Data: data}); ans.ID == nil ||
+		ans.Logins != nil {
+		t.Fatalf("second answer %+v: no login, none to tell of", ans)
 	}
 	m = minionMessage(t, ans.Data)
 	checkItems(t, m)
@@ -215,7 +220,7 @@ func TestCallEndsWithItsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	ans := sealedCall(ctx, t, a, linkclient.Call{Request: 1, Values: values, ID: [16]byte{1}, Data: data})
+	ans := sealedCall(ctx, t, a, linkclient.Call{Request: 1, Values: values, Credentials: srv.Credentials(), ID: [16]byte{1}, Data: data})
 	if took := time.Since(start); took > 3*time.Second {
 		t.Fatalf("the call took %s", took)
 	}
@@ -242,7 +247,7 @@ func TestCallKeepsToItsTimeout(t *testing.T) {
 	a.SetCallTimeout(2500 * time.Millisecond)
 	_, data := coreMessage(t, nil, shellTask(7, "sleep 30"))
 	start := time.Now()
-	ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: srv.Values(), ID: [16]byte{1}, Data: data})
+	ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: srv.Values(), Credentials: srv.Credentials(), ID: [16]byte{1}, Data: data})
 	if took := time.Since(start); took > 3*time.Second {
 		t.Fatalf("the call took %s", took)
 	}
@@ -264,18 +269,19 @@ func TestCallRefused(t *testing.T) {
 	srv := sshtest.New(t, t.TempDir())
 	a := New("http://core.invalid", "ssh-test", 4)
 	defer a.Close("the test ends")
-	values := srv.Values()
-	values["password"] = "wrong"
+	wrong := map[string]protocol.Credential{sshtest.PasswordID: srv.PasswordCredential(sshtest.PasswordID, "wrong")}
 	_, data := coreMessage(t, nil, protocol.RehelloItem{T: protocol.ItemRehello})
-	if ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: values, Data: data}); ans.Failure == nil ||
-		ans.Failure.Kind != protocol.LinkFailLogin {
+	// The answer says which credential was refused: core notes it on the
+	// target.
+	if ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: srv.Values(), Credentials: wrong, Data: data}); ans.Failure == nil ||
+		ans.Failure.Kind != protocol.LinkFailLogin || len(ans.Logins) != 1 || ans.Logins[0].Credential != sshtest.PasswordID || ans.Logins[0].Accepted {
 		t.Fatalf("answer %+v", ans)
 	}
-	if ans := a.Call(context.Background(), linkclient.Call{Request: 2, Values: srv.Values(), Data: []byte{1, 2, 3}, Keys: testLinkKeys}); ans.Failure == nil ||
+	if ans := a.Call(context.Background(), linkclient.Call{Request: 2, Values: srv.Values(), Credentials: srv.Credentials(), Data: []byte{1, 2, 3}, Keys: testLinkKeys}); ans.Failure == nil ||
 		ans.Failure.Kind != protocol.LinkFailOther {
 		t.Fatalf("a message that does not open with the call's keys: %+v", ans)
 	}
-	if ans := a.Call(context.Background(), linkclient.Call{Request: 3, Values: srv.Values(), Data: data}); ans.Failure == nil ||
+	if ans := a.Call(context.Background(), linkclient.Call{Request: 3, Values: srv.Values(), Credentials: srv.Credentials(), Data: data}); ans.Failure == nil ||
 		ans.Failure.Kind != protocol.LinkFailOther {
 		t.Fatalf("a call without keys: %+v", ans)
 	}
@@ -288,11 +294,11 @@ func TestCallRefused(t *testing.T) {
 // closes, saying why.
 func TestSessionHelloRefused(t *testing.T) {
 	srv := sshtest.New(t, t.TempDir())
-	tg, err := connection.ReadTarget(srv.Values())
+	tg, err := connection.ReadTarget(srv.Values(), srv.Credentials())
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := sshconn.Dial(context.Background(), tg)
+	c, _, err := sshconn.Dial(context.Background(), tg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,11 +388,11 @@ func (f *fakeCore) next(t *testing.T) protocol.ConnFrame {
 // core gives, it runs the tasks core pushes, its allowance standing.
 func TestSession(t *testing.T) {
 	srv := sshtest.New(t, t.TempDir())
-	tg, err := connection.ReadTarget(srv.Values())
+	tg, err := connection.ReadTarget(srv.Values(), srv.Credentials())
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := sshconn.Dial(context.Background(), tg)
+	c, _, err := sshconn.Dial(context.Background(), tg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +471,7 @@ func TestCallWindows(t *testing.T) {
 	defer a.Close("the test ends")
 	ls := protocol.TaskItem{T: protocol.ItemTask, Task: bytes.Repeat([]byte{5}, 16), Cmd: ops.Ls, Args: protocol.Args{minion.ArgLsPath: "~"}}
 	_, data := coreMessage(t, nil, protocol.RehelloItem{T: protocol.ItemRehello}, ls)
-	ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: srv.Values(), ID: [16]byte{1}, Data: data})
+	ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: srv.Values(), Credentials: srv.Credentials(), ID: [16]byte{1}, Data: data})
 	if ans.Failure != nil || ans.ID == nil {
 		t.Fatalf("answer %+v", ans)
 	}

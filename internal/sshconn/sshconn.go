@@ -1,9 +1,9 @@
 // Package sshconn reaches a server over SSH for the channel's minion
 // (docs: contracts/agentless-channels/): it dials the server, directly or
-// through a proxy, logs in with the target's password or key, checks the
-// host key it presents, and tells what came of it apart: nothing reached,
-// something that is not an SSH server, a host key other than the one
-// given, a login refused.
+// through a proxy, logs in with the target's credentials (a key, a
+// password) in turn, checks the host key it presents, and tells what came of
+// it apart: nothing reached, something that is not an SSH server, a host
+// key other than the one given, every login refused.
 package sshconn
 
 import (
@@ -39,6 +39,8 @@ type Conn struct {
 	// Peer is the IP address the channel connected to: the session's
 	// external address. Empty through a proxy that resolved a name.
 	Peer string
+	// User is who the connection logged in as.
+	User string
 
 	// opening serializes opening the SFTP client; mu guards ftp, never held
 	// across a wait, so Close never waits on the server.
@@ -183,12 +185,40 @@ func (e *NotSSHError) Error() string {
 	return fmt.Sprintf("not an SSH server (it sent %q): %v", protocol.Excerpt(e.First), e.Err)
 }
 
-// Dial reaches the target's server and logs in, within the target's
+// Dial reaches the target's server and logs in with its logins in turn, a
+// connection each, until one is taken; each try within the target's
+// connect timeout. Logins say how those tried fared: the refused ones, then
+// the one taken. A refusal (or a credential that does not read) moves on to
+// the next; anything else ends the dial, as the next would meet it too: the
+// server not reached, another host key, not an SSH server.
+func Dial(ctx context.Context, t connection.Target) (*Conn, []protocol.LinkLogin, error) {
+	if len(t.Logins) == 0 {
+		return nil, nil, &LoginError{Why: "the target gives no credentials"}
+	}
+	var logins []protocol.LinkLogin
+	var refusals []string
+	for _, l := range t.Logins {
+		c, err := dialAs(ctx, t, l)
+		var login *LoginError
+		switch {
+		case err == nil:
+			return c, append(logins, protocol.LinkLogin{Credential: l.Credential, Accepted: true}), nil
+		case errors.As(err, &login) && ctx.Err() == nil:
+			logins = append(logins, protocol.LinkLogin{Credential: l.Credential})
+			refusals = append(refusals, l.Label()+": "+login.Why)
+		default:
+			return nil, logins, err
+		}
+	}
+	return nil, logins, &LoginError{Why: strings.Join(refusals, "; ")}
+}
+
+// dialAs reaches the target's server and logs in as l, within the target's
 // connect timeout.
-func Dial(ctx context.Context, t connection.Target) (*Conn, error) {
+func dialAs(ctx context.Context, t connection.Target, l connection.Login) (*Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, t.ConnectTimeout)
 	defer cancel()
-	auth, err := authMethods(t)
+	auth, err := authMethods(l)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +233,7 @@ func Dial(ctx context.Context, t connection.Target) (*Conn, error) {
 	var presented ssh.PublicKey
 	var mismatch *HostKeyError
 	cfg := &ssh.ClientConfig{
-		User: t.User, Auth: auth,
+		User: l.User, Auth: auth,
 		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
 			presented = key
 			if t.HostKey != "" && ssh.FingerprintSHA256(key) != t.HostKey {
@@ -236,13 +266,13 @@ func Dial(ctx context.Context, t connection.Target) (*Conn, error) {
 	}
 	_ = raw.SetDeadline(time.Time{})
 	return &Conn{SSH: ssh.NewClient(conn, chans, reqs), HostKey: presented, Version: string(conn.ServerVersion()), Peer: peerOf(t, raw),
-		closed: make(chan struct{})}, nil
+		User: l.User, closed: make(chan struct{})}, nil
 }
 
-// authMethods are the target's ways of logging in: its key first, then its
-// password (as itself, and answering a keyboard-interactive prompt, which
-// many servers ask passwords by).
-func authMethods(t connection.Target) ([]ssh.AuthMethod, error) {
+// authMethods are a login's ways of logging in: a key's, or a password (as
+// itself, and answering a keyboard-interactive prompt, which many servers
+// ask passwords by).
+func authMethods(t connection.Login) ([]ssh.AuthMethod, error) {
 	var auth []ssh.AuthMethod
 	if t.PrivateKey != "" {
 		key, err := ReadableKey(t.PrivateKey)
@@ -258,7 +288,7 @@ func authMethods(t connection.Target) ([]ssh.AuthMethod, error) {
 		var missing *ssh.PassphraseMissingError
 		switch {
 		case errors.As(err, &missing):
-			return nil, &LoginError{Why: "the private key is encrypted: the target needs its passphrase"}
+			return nil, &LoginError{Why: "the private key is encrypted: the credential needs its passphrase"}
 		case err != nil && err.Error() == "ssh: no key found":
 			return nil, &LoginError{Why: "the private key does not read: no -----BEGIN … PRIVATE KEY----- block in it (give the whole key file)"}
 		case err != nil:
@@ -277,7 +307,7 @@ func authMethods(t connection.Target) ([]ssh.AuthMethod, error) {
 		}))
 	}
 	if len(auth) == 0 {
-		return nil, &LoginError{Why: "the target gives no password and no key"}
+		return nil, &LoginError{Why: "the credential gives no password and no key"}
 	}
 	return auth, nil
 }

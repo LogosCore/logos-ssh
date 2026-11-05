@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/logoscore/logos-golang-protocol/protocol"
 	"github.com/logoscore/logos-ssh/internal/sshconn"
 	"github.com/logoscore/logos-ssh/internal/sshtest"
 	"golang.org/x/crypto/ssh"
@@ -94,15 +95,12 @@ func TestDialFlattenedKey(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	sshPub, _ := ssh.NewPublicKey(pub)
 	srv.AuthorizeKey(sshPub)
-	locked, err := ssh.MarshalPrivateKeyWithPassphrase(priv, "", []byte("pass"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	key := keyCredential(t, srv, "k1", priv, "pass")
+	key.Key = strings.ReplaceAll(key.Key, "\n", " ")
+	key.Passphrase = "pass"
 	v := srv.Values()
-	delete(v, "password")
-	v["private_key"] = strings.ReplaceAll(string(pem.EncodeToMemory(locked)), "\n", " ")
-	v["passphrase"] = "pass"
-	c, err := sshconn.Dial(context.Background(), target(t, v))
+	v["credentials"] = []any{"k1"}
+	c, _, err := sshconn.Dial(context.Background(), target(t, v, map[string]protocol.Credential{"k1": key}))
 	if err != nil {
 		t.Fatal(err)
 	}

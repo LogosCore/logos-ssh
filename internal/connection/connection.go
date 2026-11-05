@@ -25,6 +25,18 @@ const Version = 1
 // prints it.
 var HostKeyPattern = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{43}=?$`)
 
+// CredentialsField is the target's credentials: keys and passwords from the
+// operation's, tried in order until one logs in.
+var CredentialsField = protocol.FieldSpec{Key: "credentials", Type: protocol.FieldCredentialList, Label: "Credentials",
+	Required: true, MaxItems: MaxLogins, Accept: []string{protocol.CredentialTypeKey, protocol.CredentialTypePlaintext},
+	Group: "Login", Order: 5,
+	Description: "Keys and passwords to log in with, tried in order until one is taken: each as its username " +
+		"(a password's with a realm as username@realm), or as the target's user when it has none."}
+
+// MaxLogins bounds a target's credentials: each is a connection to the
+// server, and its log line.
+const MaxLogins = 8
+
 // target is every kind's target fields: where the server is and how to log
 // in.
 func target() []protocol.FieldSpec {
@@ -35,12 +47,9 @@ func target() []protocol.FieldSpec {
 		{Key: "host_key", Type: protocol.FieldString, Label: "Host key", MaxLength: 60, Group: "Server", Order: 3,
 			Pattern:     HostKeyPattern.String(),
 			Description: "The server's host key's SHA-256 fingerprint (SHA256:…, as ssh-keygen -l prints it): the server must present it. Empty: the first key it presents is taken, and its session shows it to pin here."},
-		{Key: "user", Type: protocol.FieldString, Label: "User", Required: true, MaxLength: 255, Group: "Login", Order: 4},
-		{Key: "password", Type: protocol.FieldSecret, Label: "Password", MaxLength: 1024, Group: "Login", Order: 5,
-			Description: "Tried after the key, when both are given."},
-		{Key: "private_key", Type: protocol.FieldSecret, Label: "Private key", MaxLength: 16384, Group: "Login", Order: 6,
-			Format: protocol.FormatMultiline, Description: "An OpenSSH or PEM private key: the whole file, -----BEGIN through -----END."},
-		{Key: "passphrase", Type: protocol.FieldSecret, Label: "Key passphrase", MaxLength: 1024, Group: "Login", Order: 7},
+		{Key: "user", Type: protocol.FieldString, Label: "User", MaxLength: 255, Group: "Login", Order: 4,
+			Description: "Who a credential without a username logs in as."},
+		CredentialsField,
 		{Key: "proxy", Type: protocol.FieldURL, Label: "Proxy", MaxLength: 2048, Group: "Network", Order: 8,
 			Pattern:     `^(socks5|socks5h|http)://[^\s]+$`,
 			Description: "Reach the server through a proxy: socks5://host:port (a pivot, an SSH dynamic forward) or http://host:port (CONNECT)."},
@@ -81,9 +90,12 @@ func Schema() protocol.ConnectionSchema {
 type Target struct {
 	// Addr is the server's host:port; Host its host alone.
 	Addr, Host string
-	User       string
-	// Password, PrivateKey and Passphrase are how to log in: the key first.
-	Password, PrivateKey, Passphrase string
+	// User is the target's own: who a credential without a username logs
+	// in as.
+	User string
+	// Logins are the target's credentials, in its order: each tried in
+	// turn until one logs in.
+	Logins []Login
 	// HostKey is the fingerprint the server must present; empty: any.
 	HostKey string
 	Proxy   *url.URL
@@ -94,9 +106,34 @@ type Target struct {
 	Reuse, Keepalive time.Duration
 }
 
-// ReadTarget reads a call's or an open's values: core checked them against
-// the schema, but they come over the wire all the same.
-func ReadTarget(v map[string]any) (Target, error) {
+// Login is one way to log in to a target's server: one of its credentials,
+// as SSH takes it.
+type Login struct {
+	// Credential is its id, which the answer's logins name; Name is how
+	// people call it.
+	Credential, Name string
+	// User is who it logs in as.
+	User string
+	// Password is a PLAINTEXT's; PrivateKey and Passphrase a KEY's.
+	Password, PrivateKey, Passphrase string
+}
+
+// Label is how a message names the login: `root (key "prod root")`.
+func (l Login) Label() string {
+	how := "password"
+	if l.PrivateKey != "" {
+		how = "key"
+	}
+	if l.Name == "" {
+		return fmt.Sprintf("%s (%s %s)", l.User, how, l.Credential)
+	}
+	return fmt.Sprintf("%s (%s %q)", l.User, how, l.Name)
+}
+
+// ReadTarget reads a call's or an open's values, and the credentials core
+// gave beside them: core checked them against the schema, but they come
+// over the wire all the same.
+func ReadTarget(v map[string]any, given map[string]protocol.Credential) (Target, error) {
 	str := func(k string) string { s, _ := v[k].(string); return s }
 	dur := func(k string, def time.Duration) time.Duration {
 		if _, ok := v[k]; !ok {
@@ -118,11 +155,36 @@ func ReadTarget(v map[string]any) (Target, error) {
 	if port < 1 || port > 65535 {
 		return Target{}, fmt.Errorf("port %d", port)
 	}
-	t := Target{Addr: net.JoinHostPort(host, strconv.FormatInt(port, 10)), Host: host, User: str("user"),
-		Password: str("password"), PrivateKey: str("private_key"), Passphrase: str("passphrase"), HostKey: str("host_key"),
+	t := Target{Addr: net.JoinHostPort(host, strconv.FormatInt(port, 10)), Host: host, User: str("user"), HostKey: str("host_key"),
 		ConnectTimeout: dur("connect_timeout", 10*time.Second), Reuse: dur("call_reuse", 30*time.Second), Keepalive: dur("keepalive", 30*time.Second)}
-	if t.User == "" {
-		return Target{}, errors.New("no user")
+	creds, err := protocol.FieldCredentials(CredentialsField, v[CredentialsField.Key], given)
+	if err != nil {
+		return Target{}, err
+	}
+	if len(creds) == 0 {
+		return Target{}, errors.New("no credentials to log in with")
+	}
+	if len(creds) > MaxLogins {
+		return Target{}, fmt.Errorf("%d credentials, %d at most", len(creds), MaxLogins)
+	}
+	for _, c := range creds {
+		l := Login{Credential: c.ID, Name: c.Name, User: c.Username}
+		if l.User == "" {
+			l.User = t.User
+		}
+		switch c.Type {
+		case protocol.CredentialTypeKey:
+			l.PrivateKey, l.Passphrase = c.Key, c.Passphrase
+		case protocol.CredentialTypePlaintext:
+			l.Password = c.Password
+			if c.Realm != "" && l.User != "" {
+				l.User += "@" + c.Realm
+			}
+		}
+		if l.User == "" {
+			return Target{}, fmt.Errorf("credential %s has no username, and the target gives no user", l.Label())
+		}
+		t.Logins = append(t.Logins, l)
 	}
 	if t.HostKey != "" && !HostKeyPattern.MatchString(t.HostKey) {
 		return Target{}, fmt.Errorf("host key %q is not a SHA256 fingerprint", t.HostKey)
