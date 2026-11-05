@@ -164,6 +164,15 @@ func (r *Runner) MaxTasks() uint64 {
 }
 
 // Nudge asks for an early message: there is something to send.
+// AskHello has the next message say the minion's hello, as a rehello does:
+// how a persistent connection starts, the minion speaking first.
+func (r *Runner) AskHello() {
+	r.mu.Lock()
+	r.helloAsked = true
+	r.mu.Unlock()
+	r.Nudge()
+}
+
 func (r *Runner) Nudge() {
 	select {
 	case r.wake <- struct{}{}:

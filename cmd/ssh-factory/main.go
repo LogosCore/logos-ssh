@@ -1,8 +1,8 @@
 // Command ssh-factory is the SSH factory (docs: contracts/agentless-channels/):
 // it builds descriptions of SSH builds, servers the SSH channel reaches and
 // acts as the minion of. A build takes seconds and holds no program and no
-// keys: its messages go unsealed (crypto none), only through the SSH
-// channel's agentless kinds.
+// keys in it: core keeps them, and gives them to the SSH channel with each
+// call and open.
 package main
 
 import (

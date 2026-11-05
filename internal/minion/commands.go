@@ -140,7 +140,9 @@ func runShell(ctx context.Context, host Host, args protocol.Args, most time.Dura
 	if !ok || timeout <= 0 {
 		timeout = defaultShellTimeout
 	}
-	if most > 0 && timeout > most {
+	// A call's deadline, when it comes first, stops the command there.
+	cut := most > 0 && timeout > most
+	if cut {
 		timeout = most
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -149,6 +151,9 @@ func runShell(ctx context.Context, host Host, args protocol.Args, most time.Dura
 	switch {
 	case errors.Is(err, ErrNotStarted):
 		return false, nil, err.Error()
+	case errors.Is(ctx.Err(), context.DeadlineExceeded) && cut:
+		return false, nil, fmt.Sprintf("stopped at the call's deadline, after %s: a command meant to run longer needs a bind-persistent connection",
+			timeout.Round(time.Second))
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return false, nil, fmt.Sprintf("stopped after its timeout, %s", timeout)
 	case errors.Is(ctx.Err(), context.Canceled):

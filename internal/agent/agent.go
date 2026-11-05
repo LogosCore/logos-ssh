@@ -3,8 +3,9 @@
 // are answered by the minion's Caller, the server's login kept a while for
 // the next call; core's opens (bind-persistent) get a connection socket to
 // core on one side, the server's SSH connection on the other, and the
-// minion's Runner between them. Core's messages come unsealed (the SSH
-// factory's builds declare protocol.CryptoNone), and so do the minion's.
+// minion's Runner between them. Both kinds are agentless, so core gives
+// the channel the keys of each call's and open's id (protocol.LinkKeys): it
+// opens core's messages and seals the minion's with them.
 package agent
 
 import (
@@ -39,6 +40,7 @@ type Agent struct {
 
 	draining    atomic.Bool
 	linkUp      atomic.Bool
+	callTimeout atomic.Int64 // a time.Duration
 	calls       atomic.Int64
 	callsFailed atomic.Int64
 	opens       atomic.Int64
@@ -48,11 +50,24 @@ type Agent struct {
 	sessions map[*session]struct{}
 }
 
+// DefaultCallTimeout bounds a call until SetCallTimeout says otherwise:
+// what core waits for one.
+const DefaultCallTimeout = 2 * time.Minute
+
 // New is an agent for instance, opening connection sockets under core's
 // base URL, at most max persistent connections at once.
 func New(coreURL, instance string, max int) *Agent {
-	return &Agent{coreURL: coreURL, instance: instance, max: max, pool: sshconn.NewPool(), sessions: map[*session]struct{}{}}
+	a := &Agent{coreURL: coreURL, instance: instance, max: max, pool: sshconn.NewPool(), sessions: map[*session]struct{}{}}
+	a.SetCallTimeout(DefaultCallTimeout)
+	return a
 }
+
+// SetCallTimeout bounds the calls from now on: each ends at the shorter of
+// d and core's deadline, the call's tasks fitted within it.
+func (a *Agent) SetCallTimeout(d time.Duration) { a.callTimeout.Store(int64(d)) }
+
+// CallTimeout is the bound in force.
+func (a *Agent) CallTimeout() time.Duration { return time.Duration(a.callTimeout.Load()) }
 
 // SetDraining refuses (true) or takes again new calls and opens; open
 // connections stay.
@@ -127,6 +142,10 @@ func (a *Agent) Call(ctx context.Context, call linkclient.Call) linkclient.Answe
 }
 
 func (a *Agent) call(ctx context.Context, call linkclient.Call) linkclient.Answer {
+	// The shorter of core's deadline (channel-core's ctx ends at it) and
+	// the channel's own: the login and the tasks keep within it.
+	ctx, cancel := context.WithTimeout(ctx, a.CallTimeout())
+	defer cancel()
 	if a.Draining() {
 		return linkclient.Fail(protocol.LinkFailOther, "the channel is draining")
 	}
@@ -134,9 +153,16 @@ func (a *Agent) call(ctx context.Context, call linkclient.Call) linkclient.Answe
 	if err != nil {
 		return linkclient.Fail(protocol.LinkFailOther, "%s", err)
 	}
-	msg, err := minion.ReadCore(call.Data)
+	if call.Keys == nil {
+		return linkclient.Fail(protocol.LinkFailOther, "the call carries no keys: core gives a channel that acts as the minion the keys of its id")
+	}
+	plain, err := protocol.OpenFrame(call.Keys.Material, call.ID, protocol.FrameCoreToMinion, call.Data)
 	if err != nil {
-		return linkclient.Fail(protocol.LinkFailOther, "%s (a build of the SSH factory sends its messages unsealed)", err)
+		return linkclient.Fail(protocol.LinkFailOther, "core's message does not open with the call's keys")
+	}
+	msg, err := minion.ReadCore(plain)
+	if err != nil {
+		return linkclient.Fail(protocol.LinkFailOther, "%s", err)
 	}
 	c, err := a.pool.Get(ctx, t)
 	if err != nil {
@@ -161,8 +187,12 @@ func (a *Agent) call(ctx context.Context, call linkclient.Call) linkclient.Answe
 		return linkclient.Fail(protocol.LinkFailOther, "the answer does not encode: %s", err)
 	}
 	a.pool.Put(t, c, intact)
+	sealed, err := protocol.SealFrame(call.Keys.Material, call.ID, protocol.FrameMinionToCore, reply)
+	if err != nil {
+		return linkclient.Fail(protocol.LinkFailOther, "the answer does not seal: %s", err)
+	}
 	id := call.ID
-	return linkclient.Answer{ID: &id, Data: reply, Peer: c.Peer}
+	return linkclient.Answer{ID: &id, Data: sealed, Peer: c.Peer}
 }
 
 // maxFrame bounds a connection socket's frame: an id and the largest
@@ -197,6 +227,11 @@ func (a *Agent) open(ctx context.Context, o linkclient.Open) linkclient.Answer {
 	if err != nil {
 		return linkclient.Fail(protocol.LinkFailOther, "%s", err)
 	}
+	if o.Under == [16]byte{} || o.Keys == nil {
+		// The minion keeps no ids and no keys: it speaks under the id core
+		// gives, sealed with that id's keys.
+		return linkclient.Fail(protocol.LinkFailOther, "core's open says no id to speak under, or not its keys: a core older than this channel")
+	}
 	c, err := sshconn.Dial(ctx, t)
 	if err != nil {
 		return sshconn.Failure(ctx, err)
@@ -207,7 +242,7 @@ func (a *Agent) open(ctx context.Context, o linkclient.Open) linkclient.Answer {
 		_ = c.Close()
 		return linkclient.Fail(protocol.LinkFailOther, "core did not take the connection's socket: %s", err)
 	}
-	s := newSession(t, c, core, o.Request)
+	s := newSession(t, c, core, o.Request, append([]byte(nil), o.Under[:]...), o.Keys.Material)
 	a.mu.Lock()
 	a.sessions[s] = struct{}{}
 	a.mu.Unlock()

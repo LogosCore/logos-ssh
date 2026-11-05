@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -23,6 +24,9 @@ type Config struct {
 	// MaxConnections bounds the persistent connections open at once
 	// (MAX_CONNECTIONS, 1000).
 	MaxConnections int
+	// CallTimeout bounds each call (CALL_TIMEOUT, 2m: what core waits for
+	// one); core's deadline, when shorter, wins.
+	CallTimeout time.Duration
 	// RabbitMQURL is the AMQP URL for registering with core.
 	RabbitMQURL string
 	// LogFormat is the stderr log format: "json" (default) or "text".
@@ -54,6 +58,11 @@ func LoadFromEnv(envFile string) (Config, error) {
 		return Config{}, fmt.Errorf("MAX_CONNECTIONS must be an integer from 1 to 100000")
 	}
 	cfg.MaxConnections = n
+	d, err := time.ParseDuration(envOr("CALL_TIMEOUT", "2m"))
+	if err != nil || d < time.Second || d > 10*time.Minute {
+		return Config{}, fmt.Errorf("CALL_TIMEOUT must be a duration from 1s to 10m (e.g. 2m)")
+	}
+	cfg.CallTimeout = d
 	vhost := envOr("RABBITMQ_VHOST", "/")
 	cfg.RabbitMQURL = (&url.URL{
 		Scheme: "amqp",

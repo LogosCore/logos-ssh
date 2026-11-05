@@ -14,9 +14,10 @@ import (
 
 // buildSchema is what the SSH factory builds (docs:
 // contracts/agentless-channels/): servers reached over SSH, the SSH channel
-// acting as their minion. Its builds hold no program and no keys: messages
-// go unsealed (crypto none), on agentless kinds only, and a build is a
-// description of what it has. Commands added later need no new version.
+// acting as their minion. A build holds no program and no keys: it is a
+// description of what it has. Its keys stay with core, which gives them to
+// the SSH channel (the minion) with each call and open. Commands added
+// later need no new version.
 var buildSchema = protocol.BuildSchema{
 	SchemaVersion: protocol.BuildSchemaV3,
 	Version:       1,
@@ -24,7 +25,7 @@ var buildSchema = protocol.BuildSchema{
 		ModuleName: channelModule, Versions: []int{connection.Version},
 		Kinds: []protocol.BuildKind{{Kind: protocol.KindBindCall}, {Kind: protocol.KindBindPersistent}},
 	}},
-	Crypto: protocol.CryptoNone,
+	Crypto: protocol.CryptoAES256CBCHMACSHA256,
 	Targets: []protocol.BuildTarget{{
 		ID: targetServer, Label: "SSH server", Format: "json", Platforms: []string{"any/any"},
 		Description: "A server reached over SSH: the SSH channel acts as its minion, and nothing is installed on it. The build's file says what it has; add a target to the build (host, user, password or key) for each server.",
@@ -135,7 +136,8 @@ func (sshFactory) Steps(protocol.BuildRequest) []protocol.BuildStep {
 
 // description is a build's file: what it has, for the record. There is
 // nothing to deploy and nothing secret in it: the channel acts as the
-// minion, and a build has no keys.
+// minion, and core keeps the build's keys, giving them to the channel with
+// each call and open.
 type description struct {
 	BuildID     string          `json:"build_id"`
 	Module      string          `json:"module"`

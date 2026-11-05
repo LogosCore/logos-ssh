@@ -6,8 +6,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +23,43 @@ import (
 	"github.com/logoscore/logos-ssh/internal/sshconn"
 	"github.com/logoscore/logos-ssh/internal/sshtest"
 )
+
+// testKeys are a build's keys, as core gives them to the SSH channel with
+// each call and open (protocol.LinkKeys).
+var testKeys = protocol.AES256CBCHMACSHA256Material{EncKey: bytes.Repeat([]byte{1}, 32), MACKey: bytes.Repeat([]byte{2}, 32)}
+
+var testLinkKeys = &protocol.LinkKeys{Suite: protocol.CryptoAES256CBCHMACSHA256, Material: testKeys}
+
+// sealedCall is a call as core makes it to an agentless kind: its message
+// sealed under its id with the build's keys, which go with it. The
+// answer's data comes back opened.
+func sealedCall(ctx context.Context, t *testing.T, a *Agent, c linkclient.Call) linkclient.Answer {
+	t.Helper()
+	frame, err := protocol.SealFrame(testKeys, c.ID, protocol.FrameCoreToMinion, c.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Data, c.Keys = frame, testLinkKeys
+	ans := a.Call(ctx, c)
+	if ans.ID != nil && ans.Data != nil {
+		plain, err := protocol.OpenFrame(testKeys, *ans.ID, protocol.FrameMinionToCore, ans.Data)
+		if err != nil {
+			t.Fatalf("the answer does not open with the call's keys: %v", err)
+		}
+		ans.Data = plain
+	}
+	return ans
+}
+
+// openedMessage is the minion's message in a frame, opened as core opens it.
+func openedMessage(t *testing.T, f protocol.ConnFrame) protocol.MinionMessage {
+	t.Helper()
+	plain, err := protocol.OpenFrame(testKeys, [16]byte(f.ID), protocol.FrameMinionToCore, f.Data)
+	if err != nil {
+		t.Fatalf("the minion's frame does not open: %v", err)
+	}
+	return minionMessage(t, plain)
+}
 
 // coreMessage is core's message with these items, as CBOR.
 func coreMessage(t *testing.T, re []byte, items ...any) ([]byte, []byte) {
@@ -54,8 +94,7 @@ func minionMessage(t *testing.T, b []byte) protocol.MinionMessage {
 }
 
 // checkItems checks the minion's message as core checks it: its head, and
-// each item by its type, the hello as that of a minion an agentless channel
-// acts as (no process: pid 0).
+// each item by its type (the hello's pid 0: no process of its own).
 func checkItems(t *testing.T, m protocol.MinionMessage) {
 	t.Helper()
 	if err := protocol.ValidateMessageHead(m.V, m.ID, m.Re, len(m.Items)); err != nil {
@@ -65,7 +104,7 @@ func checkItems(t *testing.T, m protocol.MinionMessage) {
 		var err error
 		switch typ := protocol.ItemType(raw); typ {
 		case protocol.ItemHello:
-			err = validated(raw, protocol.HelloItem.ValidateAgentless)
+			err = validated(raw, protocol.HelloItem.Validate)
 		case protocol.ItemResult:
 			err = validated(raw, protocol.ResultItem.Validate)
 		case protocol.ItemAck:
@@ -128,7 +167,7 @@ func TestCall(t *testing.T) {
 	values["call_reuse"] = "1m"
 	buildID := [16]byte{1, 2, 3}
 	id, data := coreMessage(t, nil, protocol.RehelloItem{T: protocol.ItemRehello}, shellTask(7, "echo hi"))
-	ans := a.Call(context.Background(), linkclient.Call{Request: 1, Values: values, ID: buildID, Data: data})
+	ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: values, ID: buildID, Data: data})
 	if ans.Failure != nil || ans.ID == nil || *ans.ID != buildID || ans.Peer != "127.0.0.1" {
 		t.Fatalf("answer %+v", ans)
 	}
@@ -150,7 +189,7 @@ func TestCall(t *testing.T) {
 	download := protocol.TaskItem{T: protocol.ItemTask, Task: bytes.Repeat([]byte{9}, 16), Cmd: ops.Download,
 		Args: protocol.Args{minion.ArgDownloadPath: filepath.Join(dir, "f.txt")}}
 	_, data = coreMessage(t, nil, shellTask(8, "echo again"), download)
-	if ans = a.Call(context.Background(), linkclient.Call{Request: 2, Values: values, ID: buildID, Data: data}); ans.ID == nil {
+	if ans = sealedCall(context.Background(), t, a, linkclient.Call{Request: 2, Values: values, ID: buildID, Data: data}); ans.ID == nil {
 		t.Fatalf("second answer %+v", ans)
 	}
 	m = minionMessage(t, ans.Data)
@@ -176,7 +215,7 @@ func TestCallEndsWithItsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	ans := a.Call(ctx, linkclient.Call{Request: 1, Values: values, ID: [16]byte{1}, Data: data})
+	ans := sealedCall(ctx, t, a, linkclient.Call{Request: 1, Values: values, ID: [16]byte{1}, Data: data})
 	if took := time.Since(start); took > 3*time.Second {
 		t.Fatalf("the call took %s", took)
 	}
@@ -193,8 +232,34 @@ func TestCallEndsWithItsContext(t *testing.T) {
 	}
 }
 
+// A call core gives no deadline keeps to the channel's call timeout: a
+// command that would outlast it is stopped in time, saying so, and the
+// answer goes.
+func TestCallKeepsToItsTimeout(t *testing.T) {
+	srv := sshtest.New(t, t.TempDir())
+	a := New("http://core.invalid", "ssh-test", 4)
+	defer a.Close("the test ends")
+	a.SetCallTimeout(2500 * time.Millisecond)
+	_, data := coreMessage(t, nil, shellTask(7, "sleep 30"))
+	start := time.Now()
+	ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: srv.Values(), ID: [16]byte{1}, Data: data})
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("the call took %s", took)
+	}
+	if ans.Failure != nil || ans.ID == nil {
+		t.Fatalf("answer %+v", ans)
+	}
+	m := minionMessage(t, ans.Data)
+	checkItems(t, m)
+	if results := itemsOf[protocol.ResultItem](t, m, protocol.ItemResult); len(results) != 1 || *results[0].OK ||
+		!strings.Contains(results[0].Err, "the call's deadline") {
+		t.Fatalf("results %+v", results)
+	}
+}
+
 // A login refused is a failure of its own kind; a message that does not
-// read (sealed: not the SSH factory's) is refused before any login.
+// open with the call's keys, or a call with none, is refused before any
+// login.
 func TestCallRefused(t *testing.T) {
 	srv := sshtest.New(t, t.TempDir())
 	a := New("http://core.invalid", "ssh-test", 4)
@@ -202,14 +267,19 @@ func TestCallRefused(t *testing.T) {
 	values := srv.Values()
 	values["password"] = "wrong"
 	_, data := coreMessage(t, nil, protocol.RehelloItem{T: protocol.ItemRehello})
-	if ans := a.Call(context.Background(), linkclient.Call{Request: 1, Values: values, Data: data}); ans.Failure == nil || ans.Failure.Kind != protocol.LinkFailLogin {
+	if ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: values, Data: data}); ans.Failure == nil ||
+		ans.Failure.Kind != protocol.LinkFailLogin {
 		t.Fatalf("answer %+v", ans)
 	}
-	if ans := a.Call(context.Background(), linkclient.Call{Request: 2, Values: srv.Values(), Data: []byte{1, 2, 3}}); ans.Failure == nil ||
+	if ans := a.Call(context.Background(), linkclient.Call{Request: 2, Values: srv.Values(), Data: []byte{1, 2, 3}, Keys: testLinkKeys}); ans.Failure == nil ||
 		ans.Failure.Kind != protocol.LinkFailOther {
-		t.Fatalf("a sealed message: %+v", ans)
+		t.Fatalf("a message that does not open with the call's keys: %+v", ans)
 	}
-	if st := a.Stats(); st.CallsFailed != 2 {
+	if ans := a.Call(context.Background(), linkclient.Call{Request: 3, Values: srv.Values(), Data: data}); ans.Failure == nil ||
+		ans.Failure.Kind != protocol.LinkFailOther {
+		t.Fatalf("a call without keys: %+v", ans)
+	}
+	if st := a.Stats(); st.CallsFailed != 3 {
 		t.Fatalf("stats %+v", st)
 	}
 }
@@ -227,18 +297,16 @@ func TestSessionHelloRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	core := newFakeCore()
-	s := newSession(tg, c, core, 1)
+	buildID := bytes.Repeat([]byte{0xb}, 16)
+	s := newSession(tg, c, core, 1, buildID, testKeys)
 	ended := make(chan struct{})
 	go func() {
 		s.run()
 		close(ended)
 	}()
-	buildID := bytes.Repeat([]byte{0xb}, 16)
-	_, data := coreMessage(t, nil, protocol.RehelloItem{T: protocol.ItemRehello})
-	core.toMinion <- protocol.ConnFrame{ID: buildID, Data: data}
-	m := minionMessage(t, core.next(t).Data)
+	m := minionMessage(t, core.next(t).Data) // its hello, first
 	zero := 0
-	_, data = coreMessage(t, m.ID, protocol.ErrItem{T: protocol.ItemErr, Code: protocol.ErrItemBadMessage, Msg: "not taken", Item: &zero})
+	_, data := coreMessage(t, m.ID, protocol.ErrItem{T: protocol.ItemErr, Code: protocol.ErrItemBadMessage, Msg: "not taken", Item: &zero})
 	core.toMinion <- protocol.ConnFrame{ID: buildID, Data: data}
 	select {
 	case <-ended:
@@ -259,6 +327,13 @@ func newFakeCore() *fakeCore {
 }
 
 func (f *fakeCore) Send(_ context.Context, fr protocol.ConnFrame) error {
+	// The minion's frames, opened as core opens them: the tests read the
+	// messages.
+	plain, err := protocol.OpenFrame(testKeys, [16]byte(fr.ID), protocol.FrameMinionToCore, fr.Data)
+	if err != nil {
+		return fmt.Errorf("the minion's frame does not open: %w", err)
+	}
+	fr.Data = plain
 	select {
 	case f.fromMinion <- fr:
 		return nil
@@ -270,6 +345,12 @@ func (f *fakeCore) Send(_ context.Context, fr protocol.ConnFrame) error {
 func (f *fakeCore) Receive(_ context.Context) (protocol.ConnFrame, error) {
 	select {
 	case fr := <-f.toMinion:
+		// Core's frames, sealed as core seals them.
+		sealed, err := protocol.SealFrame(testKeys, [16]byte(fr.ID), protocol.FrameCoreToMinion, fr.Data)
+		if err != nil {
+			return protocol.ConnFrame{}, err
+		}
+		fr.Data = sealed
 		return fr, nil
 	case <-f.closed:
 		return protocol.ConnFrame{}, errors.New("closed")
@@ -296,9 +377,9 @@ func (f *fakeCore) next(t *testing.T) protocol.ConnFrame {
 	return protocol.ConnFrame{}
 }
 
-// Over a persistent connection core speaks first: the minion answers a
-// rehello with its hello under the build id, goes on under the session id
-// core gives, and runs the tasks core pushes, its allowance standing.
+// Over a persistent connection the minion speaks first: its hello alone,
+// under the id the open gave (here the build's); then under the session id
+// core gives, it runs the tasks core pushes, its allowance standing.
 func TestSession(t *testing.T) {
 	srv := sshtest.New(t, t.TempDir())
 	tg, err := connection.ReadTarget(srv.Values())
@@ -310,21 +391,14 @@ func TestSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	core := newFakeCore()
-	s := newSession(tg, c, core, 1)
+	buildID := bytes.Repeat([]byte{0xb}, 16)
+	s := newSession(tg, c, core, 1, buildID, testKeys)
 	ended := make(chan struct{})
 	go func() {
 		s.run()
 		close(ended)
 	}()
 
-	select {
-	case fr := <-core.fromMinion:
-		t.Fatalf("the minion spoke first: %+v", fr)
-	case <-time.After(300 * time.Millisecond):
-	}
-	buildID := bytes.Repeat([]byte{0xb}, 16)
-	_, data := coreMessage(t, nil, protocol.RehelloItem{T: protocol.ItemRehello})
-	core.toMinion <- protocol.ConnFrame{ID: buildID, Data: data}
 	fr := core.next(t)
 	m := minionMessage(t, fr.Data)
 	checkItems(t, m)
@@ -334,7 +408,7 @@ func TestSession(t *testing.T) {
 		t.Fatalf("the hello: %+v (%v)", m, err)
 	}
 	sid := bytes.Repeat([]byte{0x5}, 16)
-	_, data = coreMessage(t, m.ID, protocol.HelloResponseItem{T: protocol.ItemHelloResponse, SID: sid})
+	_, data := coreMessage(t, m.ID, protocol.HelloResponseItem{T: protocol.ItemHelloResponse, SID: sid})
 	core.toMinion <- protocol.ConnFrame{ID: buildID, Data: data}
 
 	// Then its standing allowance, under the session id.
@@ -375,5 +449,35 @@ func TestSession(t *testing.T) {
 	}
 	if c.Alive(time.Second) {
 		t.Fatal("the SSH connection outlived the socket")
+	}
+}
+
+// A call to a Windows server: its hello says windows, and a listing says
+// its paths as Windows writes them. Every item passes core's checks, also
+// where the server's PowerShell and cmd say nothing.
+func TestCallWindows(t *testing.T) {
+	dir := t.TempDir()
+	srv := sshtest.NewWindows(t, dir, func(context.Context, string, io.Writer, io.Writer) int { return 1 })
+	if err := os.WriteFile(filepath.Join(dir, "Users", srv.User, "f.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := New("http://core.invalid", "ssh-test", 4)
+	defer a.Close("the test ends")
+	ls := protocol.TaskItem{T: protocol.ItemTask, Task: bytes.Repeat([]byte{5}, 16), Cmd: ops.Ls, Args: protocol.Args{minion.ArgLsPath: "~"}}
+	_, data := coreMessage(t, nil, protocol.RehelloItem{T: protocol.ItemRehello}, ls)
+	ans := sealedCall(context.Background(), t, a, linkclient.Call{Request: 1, Values: srv.Values(), ID: [16]byte{1}, Data: data})
+	if ans.Failure != nil || ans.ID == nil {
+		t.Fatalf("answer %+v", ans)
+	}
+	m := minionMessage(t, ans.Data)
+	checkItems(t, m)
+	hello := itemsOf[protocol.HelloItem](t, m, protocol.ItemHello)
+	results := itemsOf[protocol.ResultItem](t, m, protocol.ItemResult)
+	if len(hello) != 1 || hello[0].OS != "windows" || len(results) != 1 || len(results[0].Ls) == 0 {
+		t.Fatalf("hello %+v, results %+v", hello, results)
+	}
+	piece := results[0].Ls[0]
+	if piece.Path != `C:\Users\`+srv.User || piece.Sep != `\` || piece.Parent != `C:\Users` || len(piece.Entries) != 1 || piece.Entries[0].Name != "f.txt" {
+		t.Fatalf("listing %+v", piece)
 	}
 }

@@ -32,25 +32,30 @@ const replyWait = time.Minute
 // both the socket to core and the SSH connection are open, and the
 // connection ends when either closes.
 //
-// Core speaks first on it, as the minion keeps nothing from one connection
-// to the next: a rehello under the build id when the target has no session
-// yet (the minion answers with its hello, and goes on under the session id
-// core's hello_response gives), otherwise a message under the session id.
-// The minion's messages go under the id core's came under; each gets core's
-// reply, and core pushes tasks and cancels between them, within the
-// minion's standing allowance (its get_tasks).
+// The minion speaks first, as on any persistent connection: its hello,
+// alone, under the id the open gave (the target's open session's, else the
+// build's: the minion keeps no ids of its own). A hello under the build id
+// opens a session, and the minion goes on under the id core's
+// hello_response gives; under a session id it says the session's host again.
+// Each message gets core's reply, and core pushes tasks and cancels between
+// them, within the minion's standing allowance (its get_tasks). Every frame
+// is sealed with the keys the open gave: the minion does not stage, so its
+// session keeps its build's keys, and they hold under the session id too.
 type session struct {
 	t       connection.Target
 	c       *sshconn.Conn
 	core    coreSide
 	request uint64
+	under   []byte
+	keys    protocol.AES256CBCHMACSHA256Material
 
 	once sync.Once
 	done chan struct{}
 }
 
-func newSession(t connection.Target, c *sshconn.Conn, core coreSide, request uint64) *session {
-	return &session{t: t, c: c, core: core, request: request, done: make(chan struct{})}
+func newSession(t connection.Target, c *sshconn.Conn, core coreSide, request uint64, under []byte,
+	keys protocol.AES256CBCHMACSHA256Material) *session {
+	return &session{t: t, c: c, core: core, request: request, under: under, keys: keys, done: make(chan struct{})}
 }
 
 // close ends the connection, both sides, once.
@@ -95,11 +100,14 @@ func (s *session) run() {
 	}()
 	keep := time.NewTicker(s.t.Keepalive)
 	defer keep.Stop()
+	// The minion speaks first: its hello.
+	r.AskHello()
 
-	// id is what the minion's messages go under: core's first message's,
-	// then the session's once a hello_response says it. inflight is the
-	// message waiting for core's reply (its id and items).
-	var id, inflight []byte
+	// id is what the minion's messages go under: the open's, then the
+	// session's once a hello_response says it. inflight is the message
+	// waiting for core's reply (its id and items).
+	id := s.under
+	var inflight []byte
 	var sent []any
 	var sentAt time.Time
 	spoke := false
@@ -110,7 +118,12 @@ func (s *session) run() {
 			s.close("a message does not encode: " + err.Error())
 			return false
 		}
-		if err := s.core.Send(context.Background(), protocol.ConnFrame{ID: id, Data: b}); err != nil {
+		frame, err := protocol.SealFrame(s.keys, [16]byte(id), protocol.FrameMinionToCore, b)
+		if err != nil {
+			s.close("a message does not seal: " + err.Error())
+			return false
+		}
+		if err := s.core.Send(context.Background(), protocol.ConnFrame{ID: id, Data: frame}); err != nil {
 			r.Failed(items)
 			s.close("send to core: " + err.Error())
 			return false
@@ -126,13 +139,19 @@ func (s *session) run() {
 			if !ok {
 				return
 			}
-			msg, err := minion.ReadCore(f.Data)
+			if len(f.ID) != 16 {
+				slog.Info("a frame from core under no id", "request", s.request)
+				continue
+			}
+			plain, err := protocol.OpenFrame(s.keys, [16]byte(f.ID), protocol.FrameCoreToMinion, f.Data)
+			if err != nil {
+				slog.Info("a frame from core that does not open with the open's keys", "request", s.request)
+				continue
+			}
+			msg, err := minion.ReadCore(plain)
 			if err != nil {
 				slog.Info("a message from core that does not read", "request", s.request, "err", err)
 				continue
-			}
-			if id == nil {
-				id = f.ID
 			}
 			var answered []any
 			if msg.Re != nil && inflight != nil && bytes.Equal(msg.Re, inflight) {
@@ -165,9 +184,6 @@ func (s *session) run() {
 				s.close("the server did not answer a keepalive")
 				return
 			}
-		}
-		if id == nil {
-			continue // core speaks first
 		}
 		if inflight != nil {
 			if time.Since(sentAt) < replyWait {

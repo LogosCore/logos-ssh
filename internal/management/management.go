@@ -1,7 +1,8 @@
 // Package management declares what core may manage on the SSH channel (its
-// log level; drain, resume, and closing its connections and the logins
-// calls keep) and what it shows (the control link, calls, connections),
-// bound to the agent. How the channel reaches core stays env-only.
+// call timeout and log level; drain, resume, and closing its connections
+// and the logins calls keep) and what it shows (the control link, calls,
+// connections), bound to the agent. How the channel reaches core stays
+// env-only.
 package management
 
 import (
@@ -35,7 +36,8 @@ func slogLevel(v any) slog.Level {
 }
 
 // Manifest is the management manifest.
-func Manifest() protocol.ManagementManifest {
+// Manifest is the channel's manifest, its call timeout's default cfg's.
+func Manifest(cfg config.Config) protocol.ManagementManifest {
 	levels := make([]protocol.EnumOption, len(logLevels))
 	for i, l := range logLevels {
 		levels[i] = protocol.EnumOption{Value: l.value, Label: l.label, Description: l.description}
@@ -43,6 +45,12 @@ func Manifest() protocol.ManagementManifest {
 	return protocol.ManagementManifest{
 		SchemaVersion: protocol.ManagementSchemaV1,
 		Properties: []protocol.PropertySpec{
+			{FieldSpec: protocol.FieldSpec{
+				Key: "call_timeout", Type: protocol.FieldDuration, Label: "Call timeout",
+				Description: "How long a call may take: its login and its tasks, a shell command stopped when it runs out. " +
+					"Core's deadline (2 minutes) applies when shorter. A command meant to run longer needs a bind-persistent connection.",
+				Group: "Calls", Order: 1, Default: cfg.CallTimeout.String(), Min: "1s", Max: "10m",
+			}, Apply: protocol.ApplyLive},
 			{FieldSpec: protocol.FieldSpec{
 				Key: "log_level", Type: protocol.FieldEnum, Label: "Log level",
 				Description: "Level of the channel's own output (stderr). The Logs tab has its own level.",
@@ -87,17 +95,27 @@ func Manifest() protocol.ManagementManifest {
 
 // New is the management server for a; log_level drives level.
 func New(cfg config.Config, a *agent.Agent, level *slog.LevelVar) (*mgmt.Server, error) {
-	s, err := mgmt.New(Manifest(), mgmt.WithSource(protocol.Source{Service: protocol.ServiceChannel, Instance: cfg.ChannelID}))
+	s, err := mgmt.New(Manifest(cfg), mgmt.WithSource(protocol.Source{Service: protocol.ServiceChannel, Instance: cfg.ChannelID}))
 	if err != nil {
 		return nil, err
 	}
 	s.OnApply(func(ctx context.Context, live map[string]any) error {
+		timeout := a.CallTimeout()
+		if v := live["call_timeout"]; v != nil {
+			d, err := protocol.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("call_timeout: %w", err)
+			}
+			timeout = d
+		}
 		lvl := slogLevel(live["log_level"])
-		if level.Level() == lvl {
+		if level.Level() == lvl && a.CallTimeout() == timeout {
 			return nil
 		}
+		a.SetCallTimeout(timeout)
 		level.Set(lvl)
-		slog.Info("management: config applied", "by", actorName(mgmt.ActorFromContext(ctx)), "log_level", lvl.String())
+		slog.Info("management: config applied", "by", actorName(mgmt.ActorFromContext(ctx)), "call_timeout", timeout.String(),
+			"log_level", lvl.String())
 		return nil
 	})
 	s.Status(func() map[string]any {

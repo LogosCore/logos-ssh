@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"slices"
 	"testing"
@@ -11,7 +12,7 @@ import (
 	"github.com/logoscore/logos-ssh/internal/ops"
 )
 
-// The schema is valid as core checks it, unsealed through the SSH channel's
+// The schema is valid as core checks it: the AES suite, the SSH channel's
 // two kinds; its commands are the minion's, by the same numbers.
 func TestSchema(t *testing.T) {
 	if err := protocol.ValidateBuildSchema(buildSchema); err != nil {
@@ -20,7 +21,7 @@ func TestSchema(t *testing.T) {
 	if _, err := mgmt.New(manifest()); err != nil {
 		t.Fatalf("manifest: %v", err)
 	}
-	if buildSchema.Crypto != protocol.CryptoNone {
+	if buildSchema.Crypto != protocol.CryptoAES256CBCHMACSHA256 {
 		t.Fatalf("crypto %q", buildSchema.Crypto)
 	}
 	var declared []uint64
@@ -38,6 +39,12 @@ func TestSchema(t *testing.T) {
 	}
 }
 
+// testMaterial are a build's keys as core sends them in the build request:
+// they stay with core, never in the description.
+var testMaterial = json.RawMessage(`{"enc_key":"` + secretKey + `","mac_key":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="}`)
+
+const secretKey = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+
 func request(commands []string) protocol.BuildRequest {
 	return protocol.BuildRequest{
 		BuildID: "5b0c4f6e-8a1d-4c2b-9e7f-3d2a1b0c9e8f", Target: targetServer, Platform: "any/any", SchemaVersion: 1,
@@ -50,7 +57,7 @@ func request(commands []string) protocol.BuildRequest {
 				Channel: protocol.ExportChannel{ModuleName: channelModule, SchemaVersion: 1}, Kind: protocol.KindBindPersistent,
 				Params: map[string]any{"keepalive": "30s"}}},
 		},
-		Crypto: &protocol.BuildCrypto{Suite: protocol.CryptoNone},
+		Crypto: &protocol.BuildCrypto{Suite: protocol.CryptoAES256CBCHMACSHA256, Material: testMaterial},
 	}
 }
 
@@ -64,6 +71,9 @@ func TestBuild(t *testing.T) {
 	var d description
 	if err := json.Unmarshal(artifact, &d); err != nil {
 		t.Fatal(err)
+	}
+	if bytes.Contains(artifact, []byte(secretKey)) || bytes.Contains(artifact, []byte("mac_key")) {
+		t.Fatal("the build's keys are in its description")
 	}
 	if d.BuildID != "5b0c4f6e-8a1d-4c2b-9e7f-3d2a1b0c9e8f" || !slices.Equal(d.Commands, []string{"ls", "walk", "download", "volumes"}) ||
 		len(d.Connections) != 2 || d.Connections[1].Kind != protocol.KindBindPersistent || d.Connections[0].Endpoint != "ssh per call" {

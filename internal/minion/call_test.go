@@ -105,15 +105,26 @@ func TestCallAnswer(t *testing.T) {
 }
 
 // A shell command runs within the call: one that would outlast it is
-// stopped before the call's deadline.
+// stopped before the call's deadline, saying so, and a task after it, with
+// too little of the call left to run, is not acked: core sends it again.
 func TestCallShellWithinTheCall(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	items := testCaller(0).Answer(ctx, coreSays(t, taskOf(1, CmdShell, protocol.Args{ArgShellCommand: "sleep 30"})))
+	items := testCaller(0).Answer(ctx, coreSays(t, taskOf(1, CmdShell, protocol.Args{ArgShellCommand: "sleep 30"}),
+		taskOf(2, CmdShell, protocol.Args{ArgShellCommand: "echo late"})))
 	r := results(items)
-	if len(r) != 1 || *r[0].OK || !strings.Contains(r[0].Err, "timeout") || time.Since(start) > 3*time.Second {
+	if len(r) != 1 || *r[0].OK || !strings.Contains(r[0].Err, "the call's deadline") || time.Since(start) > 3*time.Second {
 		t.Fatalf("%+v in %s", r, time.Since(start))
+	}
+	ack, ok := items[0].(protocol.AckItem)
+	if !ok || len(ack.Tasks) != 1 || !bytes.Equal(ack.Tasks[0], taskID(1)) {
+		t.Fatalf("acks %+v", items[0])
+	}
+	// Its own timeout, not the call's, says only that.
+	items = callWith(t, testCaller(0), taskOf(3, CmdShell, protocol.Args{ArgShellCommand: "sleep 30", ArgShellTimeout: uint64(1000)}))
+	if r := results(items); len(r) != 1 || r[0].Err != "stopped after its timeout, 1s" {
+		t.Fatalf("%+v", r)
 	}
 }
 

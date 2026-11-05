@@ -7,8 +7,7 @@ import (
 	"github.com/logoscore/logos-golang-protocol/protocol"
 )
 
-// ReadCore reads core's message from its CBOR: what a frame carries
-// unsealed (a none build's: protocol.CryptoNone).
+// ReadCore reads core's message from its CBOR, opened from its frame.
 func ReadCore(plain []byte) (protocol.CoreMessage, error) {
 	var m protocol.CoreMessage
 	if err := protocol.UnmarshalCBOR(plain, &m); err != nil {
@@ -21,7 +20,7 @@ func ReadCore(plain []byte) (protocol.CoreMessage, error) {
 }
 
 // Reply is the minion's message answering core's message re (its id) with
-// items, as CBOR: what a frame carries unsealed.
+// items, as CBOR, to seal into a frame.
 func Reply(re []byte, items []any) ([]byte, error) {
 	_, b, err := Message(re, items)
 	return b, err

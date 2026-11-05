@@ -4,10 +4,11 @@
 // 127.0.0.1: it logs in its user by password or by an authorized key, runs
 // commands in /bin/sh (each in a process group of its own, as sshd's
 // sessions run), answers signals and keepalives, and serves SFTP from a
-// folder.
+// folder. NewWindows makes one that answers as Windows's OpenSSH does.
 package sshtest
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -34,15 +35,29 @@ type Server struct {
 	// accepted nor refused: a server gone quiet under an open.
 	Stall atomic.Bool
 
+	// Signals counts the signals commands got.
+	Signals atomic.Int32
+
 	ln         net.Listener
 	mu         sync.Mutex
 	authorized []ssh.PublicKey
 	wg         sync.WaitGroup
+	// exec runs commands in place of /bin/sh, each in a ctx of execCtx's;
+	// sftpOf serves SFTP in place of the plain server (NewWindows).
+	exec    Exec
+	execCtx context.Context
+	sftpOf  func(io.ReadWriteCloser) sftpServer
 }
 
 // New starts a server for t, its SFTP and commands in dir; it stops when
 // the test ends.
 func New(t testing.TB, dir string) *Server {
+	t.Helper()
+	return newServer(t, dir, "")
+}
+
+// newServer starts a server saying version ("": x/crypto's own).
+func newServer(t testing.TB, dir, version string) *Server {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -58,6 +73,7 @@ func New(t testing.TB, dir string) *Server {
 	}
 	s := &Server{User: "tester", Password: "secret", Dir: dir, HostKey: signer, ln: ln}
 	cfg := &ssh.ServerConfig{
+		ServerVersion: version,
 		PasswordCallback: func(m ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
 			if m.User() == s.User && string(pw) == s.Password {
 				return nil, nil
@@ -150,12 +166,27 @@ func (s *Server) serve(nc net.Conn, cfg *ssh.ServerConfig) {
 func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	var mu sync.Mutex
 	var cmd *exec.Cmd
+	stop := func() {}
 	for r := range reqs {
 		switch r.Type {
 		case "exec":
 			var p struct{ Command string }
 			if ssh.Unmarshal(r.Payload, &p) != nil {
 				_ = r.Reply(false, nil)
+				continue
+			}
+			if s.exec != nil {
+				ctx, cancel := context.WithCancel(s.execCtx)
+				mu.Lock()
+				stop = cancel
+				mu.Unlock()
+				_ = r.Reply(true, nil)
+				go func() {
+					defer cancel()
+					code := s.exec(ctx, p.Command, ch, ch.Stderr())
+					_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(code)})) //nolint:gosec // an exit code
+					_ = ch.Close()
+				}()
 				continue
 			}
 			c := exec.Command("/bin/sh", "-c", p.Command)
@@ -198,8 +229,13 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			}
 			_ = r.Reply(true, nil)
 			go func() {
-				srv, err := sftp.NewServer(ch, sftp.WithServerWorkingDirectory(s.Dir))
-				if err == nil {
+				var srv sftpServer
+				if s.sftpOf != nil {
+					srv = s.sftpOf(ch)
+				} else if plain, err := sftp.NewServer(ch, sftp.WithServerWorkingDirectory(s.Dir)); err == nil {
+					srv = plain
+				}
+				if srv != nil {
 					if err := srv.Serve(); err != nil && !errors.Is(err, io.EOF) {
 						_ = srv.Close()
 					}
@@ -207,9 +243,11 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 				_ = ch.Close()
 			}()
 		case "signal":
+			s.Signals.Add(1)
 			mu.Lock()
-			c := cmd
+			c, cancel := cmd, stop
 			mu.Unlock()
+			cancel()
 			if c != nil && c.Process != nil {
 				_ = c.Process.Kill()
 			}

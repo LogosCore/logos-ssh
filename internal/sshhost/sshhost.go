@@ -1,7 +1,9 @@
 // Package sshhost is the server the SSH minion acts on (docs:
 // contracts/agentless-channels/): its files over SFTP, its commands in exec
-// channels, run by /bin/sh as BOB's minion runs them on Unix. Paths are a
-// Unix server's: Windows OpenSSH servers are not served yet.
+// channels. A Unix server's run in /bin/sh, as BOB's minion runs them on
+// Unix; a Windows server's (Windows's OpenSSH) in its default shell, cmd.exe
+// unless its administrator chose another, with paths as Windows writes them
+// (windows.go, winpath.go).
 package sshhost
 
 import (
@@ -35,8 +37,12 @@ import (
 type Host struct {
 	c *sshconn.Conn
 
-	mu  sync.Mutex
-	cwd string
+	mu sync.Mutex
+	// sftpWD is the login's folder as SFTP says it (/home/me,
+	// /C:/Users/me), read once; drive whether it is a drive's, as Windows's
+	// OpenSSH says its folders.
+	sftpWD string
+	drive  bool
 	// users and groups are the server's names by id, from /etc/passwd and
 	// /etc/group, read once.
 	named         bool
@@ -64,9 +70,62 @@ func pathErr(op, p string, err error) error {
 	return &fs.PathError{Op: op, Path: p, Err: err}
 }
 
+// login is the login's folder as SFTP says it, and whether it is a
+// drive's: read once.
+func (h *Host) login() (string, bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.sftpWD != "" {
+		return h.sftpWD, h.drive, nil
+	}
+	f, err := h.ftp()
+	if err != nil {
+		return "", false, err
+	}
+	wd, err := f.Getwd()
+	if err != nil {
+		return "", false, fmt.Errorf("the login's folder: %w", err)
+	}
+	h.sftpWD, h.drive = wd, driveSFTP(wd)
+	return wd, h.drive, nil
+}
+
+// drives reports whether the server's SFTP says a drive's folders
+// (/C:/Users/me), as Windows's OpenSSH does: its paths are then Windows's
+// (C:\Users\me), as core and the minion's commands have them, and each SFTP
+// call takes its path through remote.
+func (h *Host) drives() bool {
+	_, drive, err := h.login()
+	return err == nil && drive
+}
+
+// windows reports whether the server is a Windows one: its version says so
+// (OpenSSH_for_Windows), or its SFTP says drives. It runs commands in its
+// default shell, and the minion asks it of itself in PowerShell.
+func (h *Host) windows() bool {
+	return strings.Contains(h.c.Version, "OpenSSH_for_Windows") || h.drives()
+}
+
+// remote is a path as the server's SFTP takes it: a Windows one from its
+// drive (C:\Users is /C:/Users), any other as it is.
+func (h *Host) remote(p string) string {
+	if h.drives() {
+		return sftpPath(p)
+	}
+	return p
+}
+
 // Abs is a path from the login's folder (the user's home, where SFTP
-// starts), clean; "~" is that folder.
+// starts), clean; "~" is that folder. A Windows server's is read the
+// Windows way (winAbs): / as \, a drive alone its root.
 func (h *Host) Abs(p string) (string, error) {
+	if h.drives() {
+		wd, err := h.wd()
+		if err != nil {
+			return "", err
+		}
+		return winAbs(wd, p), nil
+	}
 	switch {
 	case p == "" || p == "~":
 		p = "."
@@ -83,42 +142,86 @@ func (h *Host) Abs(p string) (string, error) {
 	return path.Join(cwd, p), nil
 }
 
+// wd is the login's folder, as the server's paths are written.
 func (h *Host) wd() (string, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cwd != "" {
-		return h.cwd, nil
-	}
-	f, err := h.ftp()
+	wd, drive, err := h.login()
 	if err != nil {
 		return "", err
 	}
-	wd, err := f.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("the login's folder: %w", err)
+	if drive {
+		return fromSFTP(wd), nil
 	}
-	h.cwd = wd
 	return wd, nil
 }
 
-func (h *Host) Sep() string                  { return "/" }
-func (h *Host) Dir(p string) string          { return path.Dir(p) }
-func (h *Host) Join(dir, name string) string { return path.Join(dir, name) }
-func (h *Host) Base(p string) string         { return path.Base(p) }
+func (h *Host) Sep() string {
+	if h.drives() {
+		return `\`
+	}
+	return "/"
+}
+
+func (h *Host) Dir(p string) string {
+	if h.drives() {
+		return winDir(p)
+	}
+	return path.Dir(p)
+}
+
+func (h *Host) Join(dir, name string) string {
+	if h.drives() {
+		return winJoin(dir, name)
+	}
+	return path.Join(dir, name)
+}
+
+func (h *Host) Base(p string) string {
+	if h.drives() {
+		return winBase(p)
+	}
+	return path.Base(p)
+}
 
 // ReadDir lists a folder in name order: links as links, with their
 // targets; owners and groups by name where the server's files say them.
+//
+// A Windows server's SFTP says no owners, modes of its own making rather
+// than a file's attributes (which a listing's modes are on Windows), and a
+// junction as the folder it points to. Its entries' attributes come from
+// cmd's dir instead, asked as SFTP lists (winAttrs): hidden by its
+// attribute too, and a junction a link to its target, as BOB's minion lists
+// one, which walks do not enter. Where cmd cannot say, they say no mode.
 func (h *Host) ReadDir(p string) ([]minion.Entry, error) {
 	f, err := h.ftp()
 	if err != nil {
 		return nil, err
 	}
-	infos, err := f.ReadDir(p)
+	type said struct {
+		attrs map[string]winEntry
+		ok    bool
+	}
+	var asked chan said
+	if h.drives() {
+		asked = make(chan said, 1)
+		go func() {
+			attrs, ok := h.winAttrs(p)
+			asked <- said{attrs, ok}
+		}()
+	}
+	infos, err := f.ReadDir(h.remote(p))
 	if err != nil {
 		return nil, pathErr("readdir", p, err)
 	}
 	slices.SortFunc(infos, func(a, b os.FileInfo) int { return strings.Compare(a.Name(), b.Name()) })
-	users, groups := h.names()
+	win := h.windows()
+	var users, groups map[uint32]string
+	if !win {
+		users, groups = h.names()
+	}
+	var attrs said
+	if asked != nil {
+		attrs = <-asked
+	}
 	entries := make([]minion.Entry, 0, len(infos))
 	for _, fi := range infos {
 		m := fi.Mode()
@@ -129,16 +232,34 @@ func (h *Host) ReadDir(p string) ([]minion.Entry, error) {
 		}
 		mod := fi.ModTime().Unix()
 		e.Modified = &mod
-		if st, ok := fi.Sys().(*sftp.FileStat); ok {
+		if st, ok := fi.Sys().(*sftp.FileStat); ok && !win {
 			e.Mode = st.Mode
 			e.OwnerName, e.GroupName = nameOf(users, st.UID), nameOf(groups, st.GID)
 		}
+		at := h.Join(p, fi.Name())
 		if e.Type == protocol.EntryLink {
-			if target, err := f.ReadLink(path.Join(p, fi.Name())); err == nil {
+			if target, err := f.ReadLink(h.remote(at)); err == nil {
+				if h.drives() {
+					target = winTarget(target)
+				}
 				e.Target = target
 			}
 		}
-		e.Dev, e.HasDev = h.device(path.Join(p, fi.Name()))
+		if attrs.ok {
+			a := attrs.attrs[fi.Name()]
+			e.Mode, e.Hidden = a.attrs, e.Hidden || a.attrs&attrHidden != 0
+			if m.IsDir() {
+				e.Mode |= attrDirectory
+			}
+			switch {
+			case a.junction && m.IsDir():
+				e.Type, e.Target = protocol.EntryLink, a.target
+				e.Mode |= attrReparse
+			case e.Type == protocol.EntryLink:
+				e.Mode |= attrReparse
+			}
+		}
+		e.Dev, e.HasDev = h.device(at)
 		entries = append(entries, e)
 	}
 	return entries, nil
@@ -209,7 +330,7 @@ func (h *Host) Stat(p string) (minion.Info, error) {
 	if err != nil {
 		return minion.Info{}, err
 	}
-	fi, err := f.Stat(p)
+	fi, err := f.Stat(h.remote(p))
 	if err != nil {
 		return minion.Info{}, pathErr("stat", p, err)
 	}
@@ -219,8 +340,12 @@ func (h *Host) Stat(p string) (minion.Info, error) {
 }
 
 // device is the file system p is on, as the mount it is under (its place
-// among the mounts, from 1): false when the server's mounts are not known.
+// among the mounts, from 1), a Windows server's as its drive: false when
+// the server's mounts are not known.
 func (h *Host) device(p string) (uint64, bool) {
+	if h.drives() {
+		return winDevice(p)
+	}
 	mounts := h.mountPoints()
 	for i, m := range mounts {
 		if p == m || m == "/" || strings.HasPrefix(p, m+"/") {
@@ -280,16 +405,25 @@ func unescapeMount(s string) string {
 	return b.String()
 }
 
+// Lstat is the path itself, a link not followed: a Windows junction, which
+// SFTP reads as its folder, a link too (as cmd's dir says of its parent's
+// entries).
 func (h *Host) Lstat(p string) (minion.Info, error) {
 	f, err := h.ftp()
 	if err != nil {
 		return minion.Info{}, err
 	}
-	fi, err := f.Lstat(p)
+	fi, err := f.Lstat(h.remote(p))
 	if err != nil {
 		return minion.Info{}, pathErr("lstat", p, err)
 	}
-	return info(fi), nil
+	i := info(fi)
+	if fi.IsDir() && h.drives() {
+		if junction, _ := h.junction(p); junction {
+			i.Mode = fs.ModeSymlink | i.Mode.Perm()
+		}
+	}
+	return i, nil
 }
 
 // readFile is a server's file open to read.
@@ -308,7 +442,7 @@ func (h *Host) Open(p string) (minion.ReadFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	file, err := f.Open(p)
+	file, err := f.Open(h.remote(p))
 	if err != nil {
 		return nil, pathErr("open", p, err)
 	}
@@ -343,8 +477,8 @@ func (h *Host) CreateTemp(dir, pattern string) (minion.WriteFile, error) {
 	if i := strings.LastIndex(pattern, "*"); i >= 0 {
 		prefix, suffix = pattern[:i], pattern[i+1:]
 	}
-	name := path.Join(dir, prefix+randomHex(8)+suffix)
-	file, err := f.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	name := h.Join(dir, prefix+randomHex(8)+suffix)
+	file, err := f.OpenFile(h.remote(name), os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		return nil, pathErr("create", name, err)
 	}
@@ -366,7 +500,7 @@ func (h *Host) WriteAt(p string, off int64, data []byte, create bool) error {
 	if create {
 		flags |= os.O_CREATE | os.O_TRUNC
 	}
-	file, err := f.OpenFile(p, flags)
+	file, err := f.OpenFile(h.remote(p), flags)
 	if err != nil {
 		return pathErr("open", p, err)
 	}
@@ -379,68 +513,99 @@ func (h *Host) WriteAt(p string, off int64, data []byte, create bool) error {
 	return pathErr("close", p, file.Close())
 }
 
+// Chmod sets a file's permission bits; on a Windows server, its read-only
+// attribute (set without an owner's write bit), as Windows's OpenSSH takes
+// them.
 func (h *Host) Chmod(p string, mode fs.FileMode) error {
 	f, err := h.ftp()
 	if err != nil {
 		return err
 	}
-	return pathErr("chmod", p, f.Chmod(p, mode))
+	return pathErr("chmod", p, f.Chmod(h.remote(p), mode))
 }
 
 // Rename moves a file to to, replacing a file there: at once where the
-// server renames the POSIX way (OpenSSH), else by removing it first.
+// server renames the POSIX way (OpenSSH, Windows's too), else by removing it
+// first.
 func (h *Host) Rename(from, to string) error {
 	f, err := h.ftp()
 	if err != nil {
 		return err
 	}
+	src, dst := h.remote(from), h.remote(to)
 	if _, ok := f.HasExtension("posix-rename@openssh.com"); ok {
-		return pathErr("rename", to, f.PosixRename(from, to))
+		return pathErr("rename", to, f.PosixRename(src, dst))
 	}
-	if _, err := f.Lstat(to); err == nil {
-		if err := f.Remove(to); err != nil {
+	if _, err := f.Lstat(dst); err == nil {
+		if err := f.Remove(dst); err != nil {
 			return pathErr("remove", to, err)
 		}
 	}
-	return pathErr("rename", to, f.Rename(from, to))
+	return pathErr("rename", to, f.Rename(src, dst))
 }
 
+// Remove removes a file, a link or an empty folder. A Windows server
+// removes no read-only file: its read-only attribute goes first, as Go's
+// os.Remove has it on Windows.
 func (h *Host) Remove(p string) error {
 	f, err := h.ftp()
 	if err != nil {
 		return err
 	}
-	return pathErr("remove", p, f.Remove(p))
+	at := h.remote(p)
+	err = f.Remove(at)
+	if err != nil && h.windows() {
+		if fi, lerr := f.Lstat(at); lerr == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o200 == 0 && f.Chmod(at, 0o600) == nil {
+			err = f.Remove(at)
+		}
+	}
+	return pathErr("remove", p, err)
 }
 
+// RemoveAll removes a folder with what is in it; a Windows server's through
+// winRemoveAll, which enters no junction.
 func (h *Host) RemoveAll(p string) error {
+	if h.drives() {
+		return h.winRemoveAll(p)
+	}
 	f, err := h.ftp()
 	if err != nil {
 		return err
 	}
-	return pathErr("remove", p, f.RemoveAll(p))
+	return pathErr("remove", p, f.RemoveAll(h.remote(p)))
 }
 
 // pidMark starts the first line a shell command writes: its shell's
 // process id, which is its process group's, for stopping all it started.
 const pidMark = "LOGOS-PID:"
 
-// Shell runs a command line in /bin/sh on the server, its output (stdout
+// Shell runs a command line in /bin/sh on a Unix server, its output (stdout
 // and stderr, as they come) written to out. Stopped (ctx done), the
 // command's whole process group is killed: what it started too, unless it
 // left the group.
+//
+// A Windows server runs the line as typed in its default shell (cmd.exe /c
+// "<line>", as cmd.exe /d /s /c runs it for BOB's minion on Windows), and a
+// stop is a KILL signal, on which Windows's OpenSSH ends all the command
+// started; closing the channel alone would leave it running.
 func (h *Host) Shell(ctx context.Context, command string, out io.Writer) (minion.Exit, error) {
+	win := h.windows()
 	s, err := h.c.Session()
 	if err != nil {
 		return minion.Exit{}, minion.NotStarted(err)
 	}
 	defer func() { _ = s.Close() }() // ended, or killed: nothing more to say
-	w := &shellOut{w: out}
+	// A Windows command's output has no mark to look for.
+	w := &shellOut{w: out, seen: win}
 	s.Stdout, s.Stderr = w, stderrOf{w}
-	// The login's shell execs /bin/sh, which keeps its process id: the
-	// session's process, and the process group sshd made for the session.
-	wrapped := "exec /bin/sh -c " + shellQuote("echo "+pidMark+"$$; "+command)
-	if err := s.Start(wrapped); err != nil {
+	line := command
+	if !win {
+		// The login's shell execs /bin/sh, which keeps its process id: the
+		// session's process, and the process group sshd made for the
+		// session.
+		line = "exec /bin/sh -c " + shellQuote("echo "+pidMark+"$$; "+command)
+	}
+	if err := s.Start(line); err != nil {
 		return minion.Exit{}, minion.NotStarted(err)
 	}
 	done := make(chan error, 1)
@@ -448,7 +613,9 @@ func (h *Host) Shell(ctx context.Context, command string, out io.Writer) (minion
 	select {
 	case err = <-done:
 	case <-ctx.Done():
-		h.kill(w.pid())
+		if !win {
+			h.kill(w.pid())
+		}
 		_ = s.Signal(ssh.SIGKILL)
 		_ = s.Close()
 		select {
@@ -584,8 +751,11 @@ func (h *Host) run(command string, wait time.Duration) (string, error) {
 
 // Volumes are the server's mounted file systems, as df says them (GNU's
 // with their types, else POSIX's): those that hold files, with their
-// space.
+// space. A Windows server's are its drives (winVolumes).
 func (h *Host) Volumes() ([]protocol.Volume, error) {
+	if h.windows() {
+		return h.winVolumes()
+	}
 	out, err := h.run("df -kPT 2>/dev/null || df -kP", 30*time.Second)
 	if err != nil && out == "" {
 		return nil, fmt.Errorf("df: %w", err)
@@ -681,13 +851,17 @@ var Version = "dev"
 var machineIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // Hello is the server as the minion says it in its hello: its OS and
-// architecture, host name and user (uname, id), its machine id (the
-// server's own when it keeps one, else its host key's), and the SSH
-// server's version and host key.
+// architecture, host name and user (uname, id; a Windows server's as
+// winHello reads them), its machine id (the server's own when it keeps
+// one, else its host key's), and the SSH server's version and host key.
 func (h *Host) Hello() protocol.HelloItem {
 	most := uint64(4)
 	hi := protocol.HelloItem{T: protocol.ItemHello, OS: "unknown", Arch: "unknown", Version: Version, MaxTasks: &most,
 		X: map[string]any{"ssh_server": h.c.Version, "host_key": h.c.Fingerprint()}}
+	if h.windows() {
+		h.winHello(&hi)
+		return hi
+	}
 	if out, err := h.run("uname -snm; id -un; id -u", 15*time.Second); err == nil {
 		lines := strings.Split(strings.TrimSpace(out), "\n")
 		if len(lines) > 0 {
@@ -728,6 +902,12 @@ func (h *Host) machineID() (int, string) {
 			}
 		}
 	}
+	return h.hostKeyID()
+}
+
+// hostKeyID is the machine id of a server that says none of its own: the
+// SHA-256 of its host key (its SSH wire form), in hex.
+func (h *Host) hostKeyID() (int, string) {
 	sum := sha256.Sum256(h.c.HostKey.Marshal())
 	return protocol.MachineSSHHostKey, hex.EncodeToString(sum[:])
 }

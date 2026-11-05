@@ -56,6 +56,11 @@ const walkTime = 10 * time.Second
 // callMargin is what a call keeps of its deadline to answer in.
 const callMargin = 2 * time.Second
 
+// lateStart is the least of its deadline a call has left for a task after
+// its first: with less, the task waits for the next call, not acked, rather
+// than run for a moment and fail.
+const lateStart = callMargin + 3*time.Second
+
 // Answer is the minion's answer to core's message: its items, the call's
 // tasks run within ctx (the call's deadline). Tasks that do not fit the
 // answer are not acked: core sends them again in the next call.
@@ -75,10 +80,11 @@ func (c *Caller) Answer(ctx context.Context, msg protocol.CoreMessage) []any {
 				out = w.add(out, errAbout(protocol.ErrItemBadMessage, "the task does not read", i, nil))
 				continue
 			}
-			if len(acks) > 0 && w.used > w.room/2 {
+			if len(acks) > 0 && (w.used > w.room/2 || w.late()) {
 				// Less than half the answer's room left, for a task whose
-				// result may take as much: core sends it again, in the
-				// next call.
+				// result may take as much, or too little of the call's
+				// time for one to run: core sends it again, in the next
+				// call.
 				continue
 			}
 			acks = append(acks, t.Task)
@@ -145,6 +151,13 @@ type call struct {
 	// back up asks for them again.
 	folders map[string][]Entry
 	logf    func(format string, args ...any)
+}
+
+// late reports whether too little of the call's deadline is left for
+// another task to start.
+func (w *call) late() bool {
+	deadline, ok := w.ctx.Deadline()
+	return ok && time.Until(deadline) < lateStart
 }
 
 func (c *Caller) call(ctx context.Context) *call {

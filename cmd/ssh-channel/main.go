@@ -54,11 +54,13 @@ func main() {
 	defer stop()
 
 	a := agent.New(cfg.CoreBaseURL, cfg.ChannelID, cfg.MaxConnections)
+	a.SetCallTimeout(cfg.CallTimeout)
 	mgmtSrv, err := management.New(cfg, a, &level)
 	if err != nil {
 		slog.Warn("management disabled", "err", err)
 	}
-	slog.Info("logos-ssh channel starting", "channel_id", cfg.ChannelID, "core", cfg.CoreBaseURL, "max_connections", cfg.MaxConnections)
+	slog.Info("logos-ssh channel starting", "channel_id", cfg.ChannelID, "core", cfg.CoreBaseURL, "max_connections", cfg.MaxConnections,
+		"call_timeout", cfg.CallTimeout.String())
 
 	regCtx, stopReg := context.WithCancel(context.Background())
 	regDone := make(chan struct{})
