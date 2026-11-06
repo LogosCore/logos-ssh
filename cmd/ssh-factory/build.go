@@ -28,7 +28,7 @@ var buildSchema = protocol.BuildSchema{
 	Crypto: protocol.CryptoAES256CBCHMACSHA256,
 	Targets: []protocol.BuildTarget{{
 		ID: targetServer, Label: "SSH server", Format: "json", Platforms: []string{"any/any"},
-		Description: "A server reached over SSH: the SSH channel acts as its minion, and nothing is installed on it. The build's file says what it has; add a target to the build (host, user, password or key) for each server.",
+		Description: "A server reached over SSH: the SSH channel acts as its minion, and nothing is installed on it. The build's file says what it has; add a target to the build (host, the credentials to log in with) for each server.",
 	}},
 	Commands: []protocol.BuildCommand{
 		{
@@ -111,6 +111,28 @@ var buildSchema = protocol.BuildSchema{
 			ID: "volumes", Op: ops.Volumes, Label: "List volumes", Default: true,
 			Description: "Lists the server's mounted file systems (df), with their space; the file browser shows them as its roots.",
 			Action:      protocol.ActionListVolumes, Result: protocol.ResultVolumes,
+		},
+		{
+			ID: "become", Op: ops.Become, Label: "Become another user", Default: true,
+			Description: "Shell commands from now on run as another user (root unless you say), in shells elevated once on the connection through sudo or su, until unbecome. " +
+				"File commands still run as the login. A password goes only when the server asks; sudo's is the login's own unless you give one, su's the user's.",
+			Params: []protocol.FieldSpec{
+				{Key: "user", Num: minion.ArgBecomeUser, Type: protocol.FieldString, Label: "User", Default: "root", MaxLength: 32, Order: 1,
+					Description: "A user name; through sudo also #uid."},
+				{Key: "method", Num: minion.ArgBecomeMethod, Type: protocol.FieldEnum, Label: "Method", Default: minion.BecomeSudo, Order: 2,
+					Options: []protocol.EnumOption{
+						{Value: minion.BecomeSudo, Label: "sudo", Description: "sudo -u <user>: the login's password, if sudo asks."},
+						{Value: minion.BecomeSudoSu, Label: "sudo su", Description: "sudo su <user>, for sudoers that allow only su: the login's password, if sudo asks."},
+						{Value: minion.BecomeSu, Label: "su", Description: "su <user>, with the user's password, in a terminal script(1) makes on the server."},
+					}},
+				{Key: "password", Num: minion.ArgBecomePassword, Type: protocol.FieldCredential, Label: "Password", Order: 3,
+					Accept:      []string{protocol.CredentialTypePlaintext},
+					Description: "sudo's (instead of the login's own) or su's (the user's): given only when the server asks."},
+			},
+		},
+		{
+			ID: "unbecome", Op: ops.Unbecome, Label: "Unbecome", Default: true,
+			Description: "Shell commands run as the login again; the elevated shells close.",
 		},
 	},
 }

@@ -577,7 +577,9 @@ func (h *Host) RemoveAll(p string) error {
 
 // pidMark starts the first line a shell command writes: its shell's
 // process id, which is its process group's, for stopping all it started.
-const pidMark = "LOGOS-PID:"
+// Random to the connection: nothing on the server reads as the minion's
+// (the line is in the command's argv, which ps shows).
+func (h *Host) pidMark() string { return h.elev().marker + ":" }
 
 // Shell runs a command line in /bin/sh on a Unix server, its output (stdout
 // and stderr, as they come) written to out. Stopped (ctx done), the
@@ -589,6 +591,19 @@ const pidMark = "LOGOS-PID:"
 // stop is a KILL signal, on which Windows's OpenSSH ends all the command
 // started; closing the channel alone would leave it running.
 func (h *Host) Shell(ctx context.Context, command string, out io.Writer) (minion.Exit, error) {
+	return h.ShellStarted(ctx, command, out, func() {})
+}
+
+// ShellStarted is Shell, calling started once the command has what it runs
+// in: the login's channel to come, or a shell elevated as the session's
+// become, held. A become or an unbecome after that changes nothing for it.
+func (h *Host) ShellStarted(ctx context.Context, command string, out io.Writer, started func()) (minion.Exit, error) {
+	if h.Acting() != nil {
+		// The session became another user: in a shell elevated so, never
+		// as the login.
+		return h.shellAs(ctx, command, out, started)
+	}
+	started()
 	win := h.windows()
 	s, err := h.c.Session()
 	if err != nil {
@@ -596,14 +611,14 @@ func (h *Host) Shell(ctx context.Context, command string, out io.Writer) (minion
 	}
 	defer func() { _ = s.Close() }() // ended, or killed: nothing more to say
 	// A Windows command's output has no mark to look for.
-	w := &shellOut{w: out, seen: win}
+	w := &shellOut{w: out, seen: win, mark: h.pidMark()}
 	s.Stdout, s.Stderr = w, stderrOf{w}
 	line := command
 	if !win {
 		// The login's shell execs /bin/sh, which keeps its process id: the
 		// session's process, and the process group sshd made for the
 		// session.
-		line = "exec /bin/sh -c " + shellQuote("echo "+pidMark+"$$; "+command)
+		line = "exec /bin/sh -c " + shellQuote("echo "+w.mark+"$$; "+command)
 	}
 	if err := s.Start(line); err != nil {
 		return minion.Exit{}, minion.NotStarted(err)
@@ -673,6 +688,7 @@ type shellOut struct {
 	head []byte
 	seen bool
 	id   int
+	mark string
 }
 
 func (o *shellOut) Write(p []byte) (int, error) {
@@ -691,7 +707,7 @@ func (o *shellOut) Write(p []byte) (int, error) {
 	if i >= 0 {
 		line, rest = o.head[:i], o.head[i+1:]
 	}
-	if id, ok := strings.CutPrefix(string(line), pidMark); ok {
+	if id, ok := strings.CutPrefix(string(line), o.mark); ok {
 		o.id, _ = strconv.Atoi(strings.TrimSpace(id))
 	} else {
 		rest = o.head // no mark: all of it is the command's

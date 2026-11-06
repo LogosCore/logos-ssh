@@ -94,8 +94,7 @@ func (r *Runner) upload(ctx context.Context, t *Task, args protocol.Args, stream
 	r.mu.Lock()
 	t.recv = x
 	r.mu.Unlock()
-	r.logf("task %s: receiving %s (%d bytes) for %s in transfer %s", hex.EncodeToString(t.id)[:8], offer.Name, offer.Size, dest,
-		hex.EncodeToString(offer.Xfer)[:8])
+	r.logf("task %s: receiving %d bytes in transfer %s", hex.EncodeToString(t.id)[:8], offer.Size, hex.EncodeToString(offer.Xfer)[:8])
 	r.Nudge()
 
 	select {

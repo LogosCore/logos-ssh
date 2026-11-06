@@ -119,6 +119,8 @@ func checkItems(t *testing.T, m protocol.MinionMessage) {
 			err = validated(raw, protocol.MaxTasksItem.Validate)
 		case protocol.ItemErr:
 			err = validated(raw, protocol.ErrItem.Validate)
+		case protocol.ItemIdentity:
+			err = validated(raw, protocol.IdentityItem.Validate)
 		default:
 			err = errors.New("not an item a minion sends")
 		}

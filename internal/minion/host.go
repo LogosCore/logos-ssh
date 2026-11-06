@@ -117,6 +117,9 @@ type Exit struct {
 	// Signal names the signal that killed it ("killed"); empty when it
 	// exited.
 	Signal string
+	// As is who it ran as when not the login: in a shell a become elevated
+	// (sshhost). Nil: the login.
+	As *Ran
 }
 
 // ErrNotStarted is what a host's Shell error wraps when the command could

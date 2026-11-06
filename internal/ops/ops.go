@@ -16,6 +16,8 @@ const (
 	StreamUpload   = 7
 	Rm             = 8
 	Volumes        = 9
+	Become         = 10
+	Unbecome       = 11
 )
 
 // Commands are the minion's commands by number: the factory builds them
@@ -23,12 +25,12 @@ const (
 var Commands = map[uint64]minion.Command{
 	Shell: minion.CmdShell, Ls: minion.CmdLs, Walk: minion.CmdWalk, Download: minion.CmdDownload,
 	StreamDownload: minion.CmdStreamDownload, Upload: minion.CmdUpload, StreamUpload: minion.CmdStreamUpload,
-	Rm: minion.CmdRm, Volumes: minion.CmdVolumes,
+	Rm: minion.CmdRm, Volumes: minion.CmdVolumes, Become: minion.CmdBecome, Unbecome: minion.CmdUnbecome,
 }
 
 // Numbers are the commands' numbers, in order.
 func Numbers() []uint64 {
-	return []uint64{Shell, Ls, Walk, Download, StreamDownload, Upload, StreamUpload, Rm, Volumes}
+	return []uint64{Shell, Ls, Walk, Download, StreamDownload, Upload, StreamUpload, Rm, Volumes, Become, Unbecome}
 }
 
 // MaxTasks is how many tasks the minion runs at once: a call brings this

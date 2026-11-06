@@ -140,7 +140,7 @@ func TestShell(t *testing.T) {
 	var out bytes.Buffer
 	exit, err := h.Shell(context.Background(), "echo out; echo err >&2; exit 3", &out)
 	if err != nil || exit.Code == nil || *exit.Code != 3 || !strings.Contains(out.String(), "out\n") ||
-		!strings.Contains(out.String(), "err\n") || strings.Contains(out.String(), pidMark) {
+		!strings.Contains(out.String(), "err\n") || strings.Contains(out.String(), h.pidMark()) || strings.Contains(out.String(), "LOGOS") {
 		t.Fatalf("exit %+v %v, out %q", exit, err, out.String())
 	}
 

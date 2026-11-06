@@ -43,6 +43,11 @@ const (
 	// CmdVolumes lists the host's volumes: action list_volumes, result
 	// volumes.
 	CmdVolumes
+	// CmdBecome elevates the session: shell commands from then on run as
+	// another user (become.go).
+	CmdBecome
+	// CmdUnbecome: shell commands run as the login again.
+	CmdUnbecome
 )
 
 // The commands' params, by number (num).
@@ -121,20 +126,53 @@ func (w taskWriter) Write(p []byte) (int, error) {
 }
 
 // shell runs a command line in the host's shell, its output streamed,
-// within its timeout (30 seconds unless the task says).
+// within its timeout (30 seconds unless the task says). One that ran as
+// another than core took it to (a become before it ended after its ack)
+// says who, before its end.
 func (r *Runner) shell(ctx context.Context, t *Task, args protocol.Args) {
-	ok, exit, errText := runShell(ctx, r.host, args, 0, taskWriter{r: r, t: t})
-	r.End(t, ok, exit, errText)
+	end := runShell(ctx, r.host, args, 0, taskWriter{r: r, t: t}, t.started)
+	if end.notAs {
+		if msg, first := becomeFailure(r.host); first {
+			r.feedback.Report(protocol.FeedbackError, "become_failed", t.id, "%s", msg)
+		}
+	}
+	if end.ran && !ranAsSaid(end.as, t.said) {
+		r.identity(ranIdentity(t.id, end.as))
+	}
+	r.End(t, end.ok, end.exit, end.err)
 }
 
 // defaultShellTimeout is how long a shell command runs unless its task
 // says.
 const defaultShellTimeout = 30 * time.Second
 
+// shellEnd is how a shell task ended.
+type shellEnd struct {
+	// ok: it ran to its end; exit, its exit code; err, why it failed (or
+	// what killed it).
+	ok   bool
+	exit *int64
+	err  string
+	// notAs: it could not run as the acting user (a become that no longer
+	// elevates on this connection), so it did not run.
+	notAs bool
+	// ran: the command started, as as says (nil: the login).
+	ran bool
+	as  *Ran
+}
+
+// StartedShell is a host whose shell says when a command has what it runs
+// in (sshhost: the login's channel, or the shell a become elevated, held):
+// a become after that changes nothing for it.
+type StartedShell interface {
+	// ShellStarted is Shell, calling started once the command has it.
+	ShellStarted(ctx context.Context, command string, out io.Writer, started func()) (Exit, error)
+}
+
 // runShell runs a shell task's command on host, its output written to out,
-// within its timeout (most: at most this long, when not 0): whether it ran
-// to its end, its exit code, and why it failed (or what killed it).
-func runShell(ctx context.Context, host Host, args protocol.Args, most time.Duration, out io.Writer) (bool, *int64, string) {
+// within its timeout (most: at most this long, when not 0); started, when
+// not nil, once it has what it runs in.
+func runShell(ctx context.Context, host Host, args protocol.Args, most time.Duration, out io.Writer, started func()) shellEnd {
 	command, _ := protocol.ArgString(args, ArgShellCommand)
 	timeout, ok := protocol.ArgDuration(args, ArgShellTimeout)
 	if !ok || timeout <= 0 {
@@ -147,24 +185,113 @@ func runShell(ctx context.Context, host Host, args protocol.Args, most time.Dura
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	exit, err := host.Shell(ctx, command, out)
+	var exit Exit
+	var err error
+	if h, ok := host.(StartedShell); ok && started != nil {
+		exit, err = h.ShellStarted(ctx, command, out, started)
+	} else {
+		if started != nil {
+			started()
+		}
+		exit, err = host.Shell(ctx, command, out)
+	}
+	end := shellEnd{ran: true, as: exit.As}
 	switch {
+	case errors.Is(err, ErrBecome):
+		// Not run: never as the login instead.
+		return shellEnd{err: err.Error(), notAs: true}
 	case errors.Is(err, ErrNotStarted):
-		return false, nil, err.Error()
+		return shellEnd{err: err.Error()}
 	case errors.Is(ctx.Err(), context.DeadlineExceeded) && cut:
-		return false, nil, fmt.Sprintf("stopped at the call's deadline, after %s: a command meant to run longer needs a bind-persistent connection",
+		end.err = fmt.Sprintf("stopped at the call's deadline, after %s: a command meant to run longer needs a bind-persistent connection",
 			timeout.Round(time.Second))
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return false, nil, fmt.Sprintf("stopped after its timeout, %s", timeout)
+		end.err = fmt.Sprintf("stopped after its timeout, %s", timeout)
 	case errors.Is(ctx.Err(), context.Canceled):
-		return false, nil, "cancelled"
+		end.err = "cancelled"
 	case err != nil:
-		return false, nil, err.Error()
+		end.err = err.Error()
 	case exit.Signal != "":
 		// Killed by a signal: no exit code, said in err.
-		return true, nil, "killed by " + exit.Signal
+		end.ok, end.err = true, "killed by "+exit.Signal
+	default:
+		end.ok, end.exit = true, exit.Code
 	}
-	return true, exit.Code, ""
+	return end
+}
+
+// becomeFailure is why the host's shell commands cannot run as the acting
+// user, and whether it is the first time asked (for the operators, once).
+func becomeFailure(h Host) (string, bool) {
+	b, ok := h.(Becomer)
+	if !ok {
+		return "", false
+	}
+	why, first := b.BecomeFailure()
+	if why == "" {
+		return "", false
+	}
+	return fmt.Sprintf("Shell commands cannot run as the user the session became, on this connection: %s. Their tasks fail rather than run as %s: run become again, or unbecome.",
+		why, b.Login()), first
+}
+
+// become elevates the session (a become task): its identity is said for
+// the session, naming the task, before the task's end.
+func (r *Runner) become(ctx context.Context, t *Task, args protocol.Args) {
+	text, id, errText := doBecome(ctx, r.host, t.id, args)
+	if errText != "" {
+		r.End(t, false, nil, errText)
+		return
+	}
+	r.identity(id)
+	r.Write(t, []byte(text), nil)
+	r.End(t, true, nil, "")
+}
+
+// unbecome takes the session back to the login (an unbecome task).
+func (r *Runner) unbecome(t *Task) {
+	text, id, errText := doUnbecome(r.host, t.id)
+	if errText != "" {
+		r.End(t, false, nil, errText)
+		return
+	}
+	r.identity(id)
+	r.Write(t, []byte(text), nil)
+	r.End(t, true, nil, "")
+}
+
+// doBecome elevates host as a become task's args say: what the task
+// answers, the session's identity now, or why it failed.
+func doBecome(ctx context.Context, h Host, task []byte, args protocol.Args) (string, protocol.IdentityItem, string) {
+	b, ok := h.(Becomer)
+	if !ok {
+		return "", protocol.IdentityItem{}, "become: this host's shell cannot run as another user"
+	}
+	want, err := BecomeArgs(task, args)
+	if err != nil {
+		return "", protocol.IdentityItem{}, err.Error()
+	}
+	got, err := b.Become(ctx, want)
+	if err != nil {
+		return "", protocol.IdentityItem{}, err.Error()
+	}
+	return becameText(want, got, b.Login()), becameIdentity(want, got), ""
+}
+
+// doUnbecome takes host back to its login: what the task answers, and the
+// session's identity now (the process's own).
+func doUnbecome(h Host, task []byte) (string, protocol.IdentityItem, string) {
+	b, ok := h.(Becomer)
+	if !ok {
+		return "", protocol.IdentityItem{}, "unbecome: this host's shell cannot run as another user"
+	}
+	was := b.Acting()
+	b.Unbecome()
+	text := fmt.Sprintf("Shell commands run as %s again.\n", b.Login())
+	if was == nil {
+		text = fmt.Sprintf("The session had not become anyone: shell commands run as %s.\n", b.Login())
+	}
+	return text, ownIdentity(protocol.IdentitySession, task), ""
 }
 
 // volumes lists the host's volumes (docs: contracts/task-results-and-actions,

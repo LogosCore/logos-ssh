@@ -90,7 +90,7 @@ func (r *Runner) sendFile(ctx context.Context, t *Task, args protocol.Args, stre
 	r.mu.Lock()
 	t.xfer = x
 	r.mu.Unlock()
-	r.logf("task %s: sending %s (%d bytes) as transfer %s", hex.EncodeToString(t.id)[:8], abs, x.total, hex.EncodeToString(id)[:8])
+	r.logf("task %s: sending %d bytes as transfer %s", hex.EncodeToString(t.id)[:8], x.total, hex.EncodeToString(id)[:8])
 	r.Nudge()
 
 	select {

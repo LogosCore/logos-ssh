@@ -176,7 +176,9 @@ func (a *Agent) call(ctx context.Context, call linkclient.Call) linkclient.Answe
 	// (the link opens again only once its calls returned).
 	watch := context.AfterFunc(ctx, func() { _ = c.Close() })
 	host := sshhost.New(c)
-	caller := &minion.Caller{Host: host, Ops: ops.Commands, MaxTasks: ops.MaxTasks, Hello: host.Hello, Logf: logf(t.Addr)}
+	adopt(host, call.Acting, t.Addr)
+	caller := &minion.Caller{Host: host, Ops: ops.Commands, MaxTasks: ops.MaxTasks, Hello: host.Hello, Logf: logf(t.Addr),
+		Acting: minion.ActingTask(call.Acting)}
 	items := caller.Answer(ctx, msg)
 	reply, err := minion.Reply(msg.ID, items)
 	intact := watch() // false: the call's context ended, and closed the connection
@@ -254,6 +256,8 @@ func (a *Agent) open(ctx context.Context, o linkclient.Open) linkclient.Answer {
 		return ans
 	}
 	s := newSession(t, c, core, o.Request, append([]byte(nil), o.Under[:]...), o.Keys.Material)
+	s.acting = minion.ActingTask(o.Acting)
+	adopt(sshhost.New(c), o.Acting, t.Addr)
 	a.mu.Lock()
 	a.sessions[s] = struct{}{}
 	a.mu.Unlock()
@@ -265,4 +269,24 @@ func (a *Agent) open(ctx context.Context, o linkclient.Open) linkclient.Answer {
 	}()
 	slog.Info("connection open", "request", o.Request, "server", t.Addr, "user", c.User, "host_key", c.Fingerprint())
 	return linkclient.Answer{Logins: logins}
+}
+
+// adopt takes up the become core says is in effect for the session (the
+// task that made its identity: a call's or an open's acting), as the minion
+// would have kept it: the connection elevates again when a shell command
+// comes. None: shell commands run as the login.
+func adopt(h *sshhost.Host, a *protocol.LinkActing, server string) {
+	if a == nil || ops.Commands[a.Cmd] != minion.CmdBecome {
+		h.Adopt(nil)
+		return
+	}
+	b, err := minion.BecomeArgs(a.Task, a.Args)
+	if err != nil {
+		// Core checked the task's args when it was queued: one this
+		// channel does not read leaves the session as its login.
+		slog.Warn("the session's become does not read: shell commands run as the login", "server", server, "err", err)
+		h.Adopt(nil)
+		return
+	}
+	h.Adopt(&b)
 }

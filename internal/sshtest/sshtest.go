@@ -210,10 +210,21 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			c.Dir = s.Dir
 			c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			c.Stdout, c.Stderr = ch, ch.Stderr()
+			// stdin as sshd gives it: read while the command lives, never
+			// waited for (exec.Cmd would wait for a copy of its own).
+			stdin, err := c.StdinPipe()
+			if err != nil {
+				_ = r.Reply(false, nil)
+				continue
+			}
 			if err := c.Start(); err != nil {
 				_ = r.Reply(false, nil)
 				continue
 			}
+			go func() {
+				_, _ = io.Copy(stdin, ch)
+				_ = stdin.Close()
+			}()
 			mu.Lock()
 			cmd = c
 			mu.Unlock()

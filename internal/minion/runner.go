@@ -57,6 +57,13 @@ type Task struct {
 	xfer *transfer
 	// recv is the file an upload receives (upload.go); nil for others.
 	recv *receiving
+	// said is what core took the task to run as when it was acked: the
+	// task that made the session's identity then (a become), nil the
+	// process's own.
+	said []byte
+	// started lets the task after it in the runner's lane go (Runner.lane):
+	// a shell's once it holds what it runs in; nil for a task not in it.
+	started func()
 }
 
 // ID is the task's id, 16 bytes.
@@ -80,6 +87,10 @@ type Config struct {
 	Hello func() protocol.HelloItem
 	// Logf logs a line; nil: nothing is logged.
 	Logf func(format string, args ...any)
+	// Acting is the task that made the session's identity, as core said
+	// when the connection opened (an open's acting): nil, the process's
+	// own.
+	Acting []byte
 }
 
 // Runner holds the tasks of a session and what the next message says.
@@ -90,9 +101,22 @@ type Runner struct {
 	feedback *Feedback
 	logf     func(format string, args ...any)
 	seen     map[string]time.Time
-	acks     [][]byte
-	errs     []protocol.ErrItem
-	tasks    []*Task
+	// order are the acks (a task's id) and identities to say, in the order
+	// they came: the session's identity is for the tasks acked after it
+	// (docs: contracts/minion-messages/identity).
+	order []any
+	errs  []protocol.ErrItem
+	// said is the session's identity as the minion last said it: the task
+	// that made it (a become), nil the process's own.
+	said []byte
+	// lane closes when the last shell, become or unbecome task so far has
+	// what it runs as: a shell once it holds what it runs in (the login's
+	// channel, or the shell a become elevated), a become once it ended. Each
+	// waits for the one before it, so a shell runs as the session is after
+	// the becomes before it, and a become changes nothing for the shells
+	// before it.
+	lane  chan struct{}
+	tasks []*Task
 	// inflight is the last message's items when it failed: sent again first.
 	inflight []any
 	wake     chan struct{}
@@ -127,7 +151,9 @@ func NewRunner(cfg Config) *Runner {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Runner{host: cfg.Host, ops: cfg.Ops, feedback: cfg.Feedback, logf: logf,
+	done := make(chan struct{})
+	close(done)
+	return &Runner{host: cfg.Host, ops: cfg.Ops, feedback: cfg.Feedback, logf: logf, said: cfg.Acting, lane: done,
 		seen: map[string]time.Time{}, wake: make(chan struct{}, 1), hello: cfg.Hello, maxTasks: min(cfg.MaxTasks, protocol.MaxTasksLimit)}
 }
 
@@ -188,7 +214,7 @@ func (r *Runner) Wake() <-chan struct{} { return r.wake }
 func (r *Runner) Pending() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.inflight) > 0 || len(r.acks) > 0 || len(r.errs) > 0 || r.helloAsked || r.afterHello || r.maxTasksSay {
+	if len(r.inflight) > 0 || len(r.order) > 0 || len(r.errs) > 0 || r.helloAsked || r.afterHello || r.maxTasksSay {
 		return true
 	}
 	if r.feedback.Pending() {
@@ -203,9 +229,9 @@ func (r *Runner) Pending() bool {
 }
 
 // Outgoing is the next message's items: the failed message's again, or a
-// hello core asked for, acks, errs, feedback, output,
-// a file's next chunk, asks for a file core sends, a max_tasks (core set
-// the limit), and a get_tasks while the limit leaves room.
+// hello core asked for, acks and identities as they came, errs, feedback,
+// output, a file's next chunk, asks for a file core sends, a max_tasks
+// (core set the limit), and a get_tasks while the limit leaves room.
 func (r *Runner) Outgoing() []any {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -229,10 +255,26 @@ func (r *Runner) Outgoing() []any {
 		return []any{h}
 	}
 	r.helloAsked, r.afterHello = false, false
-	if len(r.acks) > 0 {
-		items = append(items, protocol.AckItem{T: protocol.ItemAck, Tasks: r.acks})
-		r.acks = nil
+	// Acks and identities as they came, before the ends of the tasks they
+	// are about: the tasks acked before the session's identity changed in
+	// an ack before it. A task's own identity goes where it came.
+	var acks [][]byte
+	for _, o := range r.order {
+		switch v := o.(type) {
+		case []byte:
+			acks = append(acks, v)
+		case protocol.IdentityItem:
+			if v.Scope == protocol.IdentitySession && len(acks) > 0 {
+				items = append(items, protocol.AckItem{T: protocol.ItemAck, Tasks: acks})
+				acks = nil
+			}
+			items = append(items, v)
+		}
 	}
+	if len(acks) > 0 {
+		items = append(items, protocol.AckItem{T: protocol.ItemAck, Tasks: acks})
+	}
+	r.order = nil
 	for _, e := range r.errs {
 		items = append(items, e)
 	}
@@ -539,6 +581,21 @@ func (r *Runner) chunk(c protocol.ChunkItem, item int) {
 	r.errs = append(r.errs, protocol.ErrItem{T: protocol.ItemErr, Code: protocol.ErrItemUnknownTask, Msg: "no such transfer", Item: &item, Task: c.Task})
 }
 
+// identity queues an identity for the next message, and asks for it: the
+// session's is for the tasks acked from now on.
+func (r *Runner) identity(id protocol.IdentityItem) {
+	r.mu.Lock()
+	r.order = append(r.order, id)
+	if id.Scope == protocol.IdentitySession {
+		r.said = nil
+		if id.How != 0 {
+			r.said = id.Task
+		}
+	}
+	r.mu.Unlock()
+	r.Nudge()
+}
+
 func (r *Runner) queueErr(code int, msg string, item int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -554,7 +611,14 @@ func (r *Runner) start(ti protocol.TaskItem) {
 			delete(r.seen, k)
 		}
 	}
-	r.acks = append(r.acks, ti.Task)
+	// While the session runs as another user, as said, a command that does
+	// not become says it runs as the login: before its ack.
+	cmd := r.ops[ti.Cmd]
+	switching := cmd == CmdBecome || cmd == CmdUnbecome
+	if !switching && !becomes(cmd) && r.said != nil {
+		r.order = append(r.order, ownIdentity(protocol.IdentityTask, ti.Task))
+	}
+	r.order = append(r.order, ti.Task)
 	if _, ran := r.seen[key]; ran {
 		r.mu.Unlock()
 		r.logf("task %s again: acked, not run again", key[:8])
@@ -562,12 +626,22 @@ func (r *Runner) start(ti protocol.TaskItem) {
 	}
 	r.seen[key] = time.Now()
 	ctx, cancel := context.WithCancel(context.Background())
-	t := &Task{id: ti.Task, cmd: ti.Cmd, cancel: cancel}
+	t := &Task{id: ti.Task, cmd: ti.Cmd, cancel: cancel, said: r.said}
 	r.tasks = append(r.tasks, t)
+	// In the lane: after the task before it there has what it runs as.
+	var wait chan struct{}
+	if switching || becomes(cmd) {
+		done := make(chan struct{})
+		var once sync.Once
+		wait, r.lane, t.started = r.lane, done, func() { once.Do(func() { close(done) }) }
+	}
 	r.mu.Unlock()
-	r.logf("task %s: command %d %v", key[:8], ti.Cmd, ti.Args)
+	r.logf("task %s: command %d", key[:8], ti.Cmd)
 	go func() {
 		defer cancel()
+		if t.started != nil {
+			defer t.started()
+		}
 		// A command that panics fails its task, and says so to the
 		// operators, rather than taking the minion down.
 		defer func() {
@@ -577,6 +651,15 @@ func (r *Runner) start(ti protocol.TaskItem) {
 				r.Nudge()
 			}
 		}()
+		if wait != nil {
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				r.End(t, false, nil, "cancelled")
+				r.Nudge()
+				return
+			}
+		}
 		if r.exec != nil {
 			r.exec(ctx, t, ti)
 		} else {
@@ -596,7 +679,7 @@ func (r *Runner) reack(ids [][]byte, item int) {
 	defer r.mu.Unlock()
 	for _, id := range ids {
 		if slices.ContainsFunc(r.tasks, func(t *Task) bool { return slices.Equal(t.id, id) }) {
-			r.acks = append(r.acks, id)
+			r.order = append(r.order, id)
 			continue
 		}
 		r.errs = append(r.errs, protocol.ErrItem{T: protocol.ItemErr, Code: protocol.ErrItemUnknownTask,
@@ -734,6 +817,10 @@ func (r *Runner) run(ctx context.Context, t *Task, ti protocol.TaskItem) {
 		r.shell(ctx, t, ti.Args)
 	case CmdVolumes:
 		r.volumes(t)
+	case CmdBecome:
+		r.become(ctx, t, ti.Args)
+	case CmdUnbecome:
+		r.unbecome(t)
 	default:
 		r.End(t, false, nil, fmt.Sprintf("command %d is not one this minion knows", ti.Cmd))
 	}

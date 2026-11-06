@@ -39,8 +39,12 @@ type Conn struct {
 	// Peer is the IP address the channel connected to: the session's
 	// external address. Empty through a proxy that resolved a name.
 	Peer string
-	// User is who the connection logged in as.
-	User string
+	// User is who the connection logged in as; Password the password it
+	// logged in with, when the login was a password's (a PLAINTEXT
+	// credential's): what a become's sudo asks for unless the task gives
+	// another. Never logged.
+	User     string
+	Password string
 
 	// opening serializes opening the SFTP client; mu guards ftp, never held
 	// across a wait, so Close never waits on the server.
@@ -51,6 +55,27 @@ type Conn struct {
 	// closed is closed with the connection: what waits on the server gives
 	// up with it.
 	closed chan struct{}
+	// state is what lives as long as the connection does (State): the
+	// shells a become keeps open on it, say.
+	stateMu sync.Mutex
+	state   map[any]any
+}
+
+// State is the connection's value for key, made by create the first time
+// it is asked for: what outlives each call on a connection kept for the
+// next (a become's elevated shells), and goes with it.
+func (c *Conn) State(key any, create func() any) any {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if v, ok := c.state[key]; ok {
+		return v
+	}
+	if c.state == nil {
+		c.state = map[any]any{}
+	}
+	v := create()
+	c.state[key] = v
+	return v
 }
 
 // OpenWait bounds opening a channel (a session, the SFTP client): a server
@@ -266,7 +291,16 @@ func dialAs(ctx context.Context, t connection.Target, l connection.Login) (*Conn
 	}
 	_ = raw.SetDeadline(time.Time{})
 	return &Conn{SSH: ssh.NewClient(conn, chans, reqs), HostKey: presented, Version: string(conn.ServerVersion()), Peer: peerOf(t, raw),
-		User: l.User, closed: make(chan struct{})}, nil
+		User: l.User, Password: passwordOf(l), closed: make(chan struct{})}, nil
+}
+
+// passwordOf is the password a login logged in with: a password's, none for
+// a key's.
+func passwordOf(l connection.Login) string {
+	if l.PrivateKey != "" {
+		return ""
+	}
+	return l.Password
 }
 
 // authMethods are a login's ways of logging in: a key's, or a password (as

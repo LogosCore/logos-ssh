@@ -64,7 +64,7 @@ func TestTaskOnceAndUnknownCancel(t *testing.T) {
 	}
 	r.start(vols)
 	r.mu.Lock()
-	tasks, acks := len(r.tasks), len(r.acks)
+	tasks, acks := len(r.tasks), len(queuedAcks(r))
 	r.mu.Unlock()
 	if tasks != 1 || acks != 2 {
 		t.Fatalf("tasks %d acks %d", tasks, acks)
@@ -354,10 +354,21 @@ func TestReack(t *testing.T) {
 	r.Take(protocol.CoreMessage{V: protocol.MinionMessageV3, Items: []cbor.RawMessage{raw}}, nil)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.acks) != 2 || !bytes.Equal(r.acks[0], running) || !bytes.Equal(r.acks[1], ended) {
-		t.Fatalf("acks %x", r.acks)
+	if acks := queuedAcks(r); len(acks) != 2 || !bytes.Equal(acks[0], running) || !bytes.Equal(acks[1], ended) {
+		t.Fatalf("acks %x", acks)
 	}
 	if len(r.errs) != 1 || r.errs[0].Code != protocol.ErrItemUnknownTask || !bytes.Equal(r.errs[0].Task, gone) || *r.errs[0].Item != 0 {
 		t.Fatalf("errs %+v", r.errs)
 	}
+}
+
+// queuedAcks are the tasks the runner's next message acks, in order.
+func queuedAcks(r *Runner) [][]byte {
+	var ids [][]byte
+	for _, o := range r.order {
+		if id, ok := o.([]byte); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }

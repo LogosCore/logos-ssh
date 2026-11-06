@@ -48,6 +48,9 @@ type session struct {
 	request uint64
 	under   []byte
 	keys    protocol.AES256CBCHMACSHA256Material
+	// acting is the task that made the session's identity, as the open
+	// said (nil: none): what core takes the first tasks to run as.
+	acting []byte
 
 	once sync.Once
 	done chan struct{}
@@ -73,7 +76,7 @@ func (s *session) run() {
 	host := sshhost.New(s.c)
 	feedback := minion.NewFeedback(logf(s.t.Addr))
 	r := minion.NewRunner(minion.Config{Host: host, Ops: ops.Commands, MaxTasks: ops.MaxTasks, Feedback: feedback,
-		Hello: host.Hello, Logf: logf(s.t.Addr)})
+		Hello: host.Hello, Logf: logf(s.t.Addr), Acting: s.acting})
 	feedback.SetWake(r.Nudge)
 	r.SetPersistent(true)
 	r.SetLimit(protocol.MaxMinionMessageSize)

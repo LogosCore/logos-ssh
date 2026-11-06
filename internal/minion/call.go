@@ -43,6 +43,9 @@ type Caller struct {
 	Hello func() protocol.HelloItem
 	// Logf logs a line; nil: nothing is logged.
 	Logf func(format string, args ...any)
+	// Acting is the task that made the session's identity, as the call
+	// carries it (its acting): nil, the process's own.
+	Acting []byte
 }
 
 // DefaultCallTasks is how many tasks a call may bring unless the Caller
@@ -67,7 +70,12 @@ const lateStart = callMargin + 3*time.Second
 func (c *Caller) Answer(ctx context.Context, msg protocol.CoreMessage) []any {
 	w := c.call(ctx)
 	var out []any
+	// The acks and identities go first, as they came: the session's identity
+	// is for the tasks acked after it, so the tasks before it go in an ack
+	// before it (docs: contracts/minion-messages/identity).
+	var order []any
 	var acks [][]byte
+	took := 0
 	for i, raw := range msg.Items {
 		switch protocol.ItemType(raw) {
 		case protocol.ItemRehello:
@@ -80,15 +88,34 @@ func (c *Caller) Answer(ctx context.Context, msg protocol.CoreMessage) []any {
 				out = w.add(out, errAbout(protocol.ErrItemBadMessage, "the task does not read", i, nil))
 				continue
 			}
-			if len(acks) > 0 && (w.used > w.room/2 || w.late()) {
+			if took > 0 && (w.used > w.room/2 || w.late()) {
 				// Less than half the answer's room left, for a task whose
 				// result may take as much, or too little of the call's
 				// time for one to run: core sends it again, in the next
 				// call.
 				continue
 			}
+			took++
+			// While the session runs as another user, as said, a command
+			// that does not become says it runs as the login.
+			cmd := c.Ops[t.Cmd]
+			if cmd != CmdBecome && cmd != CmdUnbecome && !becomes(cmd) && w.said != nil {
+				order = w.add(order, ownIdentity(protocol.IdentityTask, t.Task))
+			}
 			acks = append(acks, t.Task)
-			out = w.add(out, w.run(t)...)
+			items, id := w.runTask(t)
+			if id != nil {
+				if len(acks) > 0 {
+					order = append(order, protocol.AckItem{T: protocol.ItemAck, Tasks: acks})
+					acks = nil
+				}
+				order = w.add(order, *id)
+				w.said = nil
+				if id.How != 0 {
+					w.said = id.Task
+				}
+			}
+			out = w.add(out, items...)
 		case protocol.ItemCancel:
 			var x protocol.CancelItem
 			if protocol.UnmarshalCBOR(raw, &x) != nil || x.Validate() != nil {
@@ -129,8 +156,9 @@ func (c *Caller) Answer(ctx context.Context, msg protocol.CoreMessage) []any {
 		}
 	}
 	if len(acks) > 0 {
-		out = append([]any{protocol.AckItem{T: protocol.ItemAck, Tasks: acks}}, out...)
+		order = append(order, protocol.AckItem{T: protocol.ItemAck, Tasks: acks})
 	}
+	out = append(order, out...)
 	most := c.MaxTasks
 	if most == 0 {
 		most = DefaultCallTasks
@@ -151,6 +179,9 @@ type call struct {
 	// back up asks for them again.
 	folders map[string][]Entry
 	logf    func(format string, args ...any)
+	// said is the session's identity as the call said it so far: the task
+	// that made it (a become), nil the process's own.
+	said []byte
 }
 
 // late reports whether too little of the call's deadline is left for
@@ -169,7 +200,7 @@ func (c *Caller) call(ctx context.Context) *call {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &call{c: c, ctx: ctx, host: c.Host, limit: limit, room: limit * 2 / 3, folders: map[string][]Entry{}, logf: logf}
+	return &call{c: c, ctx: ctx, host: c.Host, limit: limit, room: limit * 2 / 3, folders: map[string][]Entry{}, logf: logf, said: c.Acting}
 }
 
 // add adds items to the answer, counting their size.
@@ -217,10 +248,30 @@ func failed(task []byte, why string) protocol.ResultItem {
 	return protocol.ResultItem{T: protocol.ItemResult, Task: task, Done: true, OK: &ok, Err: why}
 }
 
+// runTask runs a task within the call: what it says now, and the session's
+// identity when the task changed it (a become, an unbecome).
+func (w *call) runTask(t protocol.TaskItem) ([]any, *protocol.IdentityItem) {
+	switch w.c.Ops[t.Cmd] {
+	case CmdBecome:
+		text, id, errText := doBecome(w.ctx, w.host, t.Task, t.Args)
+		if errText != "" {
+			return []any{failed(t.Task, errText)}, nil
+		}
+		return []any{done(t.Task, []byte(text), nil)}, &id
+	case CmdUnbecome:
+		text, id, errText := doUnbecome(w.host, t.Task)
+		if errText != "" {
+			return []any{failed(t.Task, errText)}, nil
+		}
+		return []any{done(t.Task, []byte(text), nil)}, &id
+	}
+	return w.run(t), nil
+}
+
 // run runs a task within the call: what it says now (its result, or a
 // transfer's first item).
 func (w *call) run(t protocol.TaskItem) []any {
-	w.logf("task %s: command %d %v", hex.EncodeToString(t.Task)[:8], t.Cmd, t.Args)
+	w.logf("task %s: command %d", hex.EncodeToString(t.Task)[:8], t.Cmd)
 	switch w.c.Ops[t.Cmd] {
 	case CmdLs:
 		return []any{w.ls(t)}
@@ -231,7 +282,7 @@ func (w *call) run(t protocol.TaskItem) []any {
 		}
 		return []any{done(t.Task, []byte(out), nil)}
 	case CmdShell:
-		return []any{w.shell(t)}
+		return w.shell(t)
 	case CmdVolumes:
 		return w.volumes(t)
 	case CmdDownload:
@@ -335,18 +386,42 @@ func (c *capped) Write(p []byte) (int, error) {
 
 // shell runs a command within the call: its output in one result, as much
 // as the answer has room for.
-func (w *call) shell(t protocol.TaskItem) protocol.ResultItem {
+func (w *call) shell(t protocol.TaskItem) []any {
 	most := time.Duration(0)
 	if deadline, ok := w.ctx.Deadline(); ok {
 		most = max(time.Until(deadline)-callMargin, time.Second)
 	}
 	out := &capped{most: max(1<<10, min(w.limit*2/3, w.room-w.used))}
-	ok, exit, errText := runShell(w.ctx, w.host, t.Args, most, out)
+	end := runShell(w.ctx, w.host, t.Args, most, out, nil)
 	if out.cut {
 		out.buf.WriteString("\n[the output goes on: cut to fit the answer]\n")
 	}
-	r := protocol.ResultItem{T: protocol.ItemResult, Task: t.Task, Done: true, OK: &ok, Out: out.buf.Bytes(), Exit: exit, Err: errText}
-	return r
+	ok := end.ok
+	r := protocol.ResultItem{T: protocol.ItemResult, Task: t.Task, Done: true, OK: &ok, Out: out.buf.Bytes(), Exit: end.exit, Err: end.err}
+	var items []any
+	if end.ran && !ranAsSaid(end.as, w.said) {
+		// Ran as another than core took it to, when it was acked: who.
+		items = append(items, ranIdentity(t.Task, end.as))
+	}
+	if end.notAs {
+		// A minion that keeps nothing says it in the answer, once a
+		// connection.
+		if msg, first := becomeFailure(w.host); first {
+			items = append(items, feedbackItem(protocol.FeedbackError, "become_failed", t.Task, msg))
+		}
+	}
+	return append(items, r)
+}
+
+// feedbackItem is a warning or an error for the operators, in an answer.
+func feedbackItem(level int, code string, task []byte, msg string) protocol.FeedbackItem {
+	if len(msg) > protocol.MaxFeedbackMsg {
+		msg = msg[:protocol.MaxFeedbackMsg-3] + "..."
+	}
+	f := protocol.FeedbackItem{T: protocol.ItemFeedback, ID: make([]byte, protocol.FeedbackIDSize), Level: level, Code: code,
+		Task: task, Msg: msg, At: uint64(max(time.Now().Unix(), 0)), Count: 1}
+	_, _ = rand.Read(f.ID)
+	return f
 }
 
 // volumes lists the host's volumes within the call: parts of half a
@@ -666,8 +741,7 @@ func (w *call) startReceive(t protocol.TaskItem, stream bool) []any {
 	if err := w.host.WriteAt(tmp, 0, nil, true); err != nil {
 		return []any{failed(t.Task, err.Error())}
 	}
-	w.logf("task %s: receiving %s (%d bytes) for %s in transfer %s", hex.EncodeToString(t.Task)[:8], offer.Name, offer.Size, abs,
-		hex.EncodeToString(offer.Xfer)[:8])
+	w.logf("task %s: receiving %d bytes in transfer %s", hex.EncodeToString(t.Task)[:8], offer.Size, hex.EncodeToString(offer.Xfer)[:8])
 	if !stream && offer.Size == 0 {
 		return w.place(offer.Xfer, x, offer.SHA256, 0)
 	}
