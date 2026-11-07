@@ -22,8 +22,9 @@ import (
 // minion writes shell commands into, one at a time each, as a person types
 // into the shell sudo su gave them. One lives on a connection: shell
 // commands take turns in it while the session is elevated, and a become
-// made while one is in effect runs inside it (root's su asks nothing). It
-// goes with the connection, or at unbecome.
+// made while one is in effect runs inside it (root's su asks nothing), or
+// from the login when that one does not elevate on the connection. It goes
+// with the connection, or at unbecome.
 //
 // A command goes into its shell as one line: in a subshell in the
 // background, in a process group of its own (setsid), stdin /dev/null,
@@ -131,13 +132,21 @@ func (e *elevation) reset() {
 }
 
 // Become elevates a shell as b says, now: from then on shell commands run in
-// shells elevated so. One that fails leaves the connection as it was.
+// shells elevated so. One that fails leaves the connection as it was. While
+// another is in effect it goes on from that one's shell; when that one does
+// not elevate on the connection (a password no longer taken, a become only
+// another made possible), from the login, as with none in effect: becoming
+// again is how the session gets past it.
 func (h *Host) Become(ctx context.Context, b minion.Become) (minion.Became, error) {
 	if h.windows() {
 		return minion.Became{}, becomeFail("a Windows server has no sudo or su")
 	}
 	if h.Acting() != nil {
-		return h.becomeFrom(ctx, b)
+		got, err := h.becomeFrom(ctx, b)
+		var stuck notElevated
+		if !errors.As(err, &stuck) || ctx.Err() != nil {
+			return got, err
+		}
 	}
 	s, got, err := h.elevate(ctx, b)
 	if err != nil {
@@ -157,7 +166,9 @@ func (h *Host) Become(ctx context.Context, b minion.Become) (minion.Became, erro
 // becomeFrom becomes b from the shell elevated now (root, say): inside it,
 // so su from root asks nothing. One that fails leaves the shell as it was.
 // A connection that comes later elevates as b alone (core gives the last
-// become): one only another made possible fails there, and says so.
+// become): one only another made possible fails there, and says so. When
+// the become in effect does not elevate, it fails with notElevated, and
+// Become goes from the login.
 func (h *Host) becomeFrom(ctx context.Context, b minion.Become) (minion.Became, error) {
 	e := h.elev()
 	s, err := e.acquire(ctx, h)
@@ -232,6 +243,13 @@ func (h *Host) shellAs(ctx context.Context, command string, out io.Writer, start
 	}
 }
 
+// notElevated is acquire's error when the become in effect does not elevate
+// on the connection: elevating it again failed, as err says (ErrBecome).
+type notElevated struct{ err error }
+
+func (n notElevated) Error() string { return n.err.Error() }
+func (n notElevated) Unwrap() error { return n.err }
+
 // acquire is an idle shell of the become in effect, or a new one elevated,
 // waiting while maxShells are busy.
 func (e *elevation) acquire(ctx context.Context, h *Host) (*rootShell, error) {
@@ -274,7 +292,7 @@ func (e *elevation) acquire(ctx context.Context, h *Host) (*rootShell, error) {
 				if why != e.failure {
 					e.failure, e.told = why, false
 				}
-				return nil, err
+				return nil, notElevated{err}
 			}
 			e.failure, e.told = "", false
 			s.gen = gen

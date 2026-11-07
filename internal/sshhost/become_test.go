@@ -218,6 +218,58 @@ func TestAdoptFails(t *testing.T) {
 	}
 }
 
+// A become while the one core gave does not elevate on the connection (the
+// login's password no longer taken) goes from the login, as with none in
+// effect, so becoming again gets the session past it. One that fails from
+// the login too leaves the session as it was.
+func TestBecomeAfterAdoptFails(t *testing.T) {
+	h, _ := becomeHost(t, "wrong")
+	ctx := context.Background()
+	old := minion.Become{Task: make([]byte, 16), User: "root", Method: minion.BecomeSudo}
+	h.Adopt(&old)
+	if _, _, err := shell(t, h, "echo never"); !errors.Is(err, minion.ErrBecome) {
+		t.Fatalf("%v", err)
+	}
+	again := minion.Become{Task: []byte("0123456789abcdef"), User: "root", Method: minion.BecomeSudo, Password: "sudo-pw", Credential: "c1"}
+	got, err := h.Become(ctx, again)
+	if err != nil || !got.PasswordUsed {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if a := h.Acting(); a == nil || !a.Same(again) {
+		t.Fatalf("acting %+v", a)
+	}
+	if why, _ := h.BecomeFailure(); why != "" {
+		t.Fatalf("still failing: %q", why)
+	}
+	if out, _, err := shell(t, h, "echo now"); err != nil || out != "now\n" {
+		t.Fatalf("%q %v", out, err)
+	}
+
+	h.Adopt(&old)
+	refused := again
+	refused.Password = "nope"
+	if _, err := h.Become(ctx, refused); err == nil || !strings.Contains(err.Error(), "refused the password (the become's credential)") {
+		t.Fatalf("%v", err)
+	}
+	if a := h.Acting(); a == nil || !a.Same(old) {
+		t.Fatalf("acting %+v", a)
+	}
+}
+
+// A become while the one core gave elevates on the connection goes on
+// inside it, as from a shell elevated earlier: su from root asks nothing.
+func TestBecomeFromAdopted(t *testing.T) {
+	h, _ := becomeHost(t, "sudo-pw")
+	h.Adopt(&minion.Become{Task: make([]byte, 16), User: "root", Method: minion.BecomeSudo})
+	got, err := h.Become(context.Background(), minion.Become{Task: []byte("0123456789abcdef"), User: "postgres", Method: minion.BecomeSu})
+	if err != nil || got.PasswordUsed {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if out, _, err := shell(t, h, "echo nested $FAKE_USER"); err != nil || out != "nested postgres\n" {
+		t.Fatalf("%q %v", out, err)
+	}
+}
+
 // A become from an elevated shell goes on inside it: su from root asks
 // nothing. One refused leaves the shell as it was.
 func TestBecomeFromElevated(t *testing.T) {

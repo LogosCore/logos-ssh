@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-`logos-ssh` (`github.com/logoscore/logos-ssh`): the SSH module, an agentless channel and its factory (docs `contracts/agentless-channels.md`, a draft until core and the docs land). Two programs, one image: `cmd/ssh-channel` (module `ssh`, a channel: both kinds `agentless`, the channel acting as the minion of the servers it logs in to) and `cmd/ssh-factory` (module `ssh`, a factory: builds with the AES suite as any factory's, a JSON description each, nothing to deploy; core keeps a build's keys and gives them to the channel with each call and open, as its kinds are agentless). The two share a module name, as the Dumbo pair do, with their own instance ids (`ssh-local`, `ssh-factory-local`). README.md has what they declare and how a call and an open go.
+`logos-ssh` (`github.com/logoscore/logos-ssh`): the SSH module, an agentless channel and its factory (docs `contracts/agentless-channels.md`). Two programs, one image: `cmd/ssh-channel` (module `ssh`, a channel: both kinds `agentless`, the channel acting as the minion of the servers it logs in to) and `cmd/ssh-factory` (module `ssh`, a factory: builds with the AES suite as any factory's, a JSON description each, nothing to deploy; core keeps a build's keys and gives them to the channel with each call and open, as its kinds are agentless). The two share a module name, as the Dumbo pair do, with their own instance ids (`ssh-local`, `ssh-factory-local`). README.md has what they declare and how a call and an open go.
 
 ## Commands
 
