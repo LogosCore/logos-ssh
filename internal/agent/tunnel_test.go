@@ -302,14 +302,4 @@ func TestSessionReverseTunnel(t *testing.T) {
 			return string(got) == "to core"
 		})
 	}, nil)
-
-	// UDP: SSH has none.
-	udpTask := bytes.Repeat([]byte{0x9}, 16)
-	cs.push(protocol.TaskItem{T: protocol.ItemTask, Task: udpTask, Cmd: ops.ReverseTunnel,
-		Args: protocol.Args{minion.ArgReverseListen: int64(0), minion.ArgReverseUDP: true}})
-	cs.until("the UDP task's failure", func(raw []byte) bool {
-		return is(t, raw, protocol.ItemResult, func(r protocol.ResultItem) bool {
-			return bytes.Equal(r.Task, udpTask) && r.Done && !*r.OK && strings.Contains(r.Err, "UDP")
-		})
-	}, nil)
 }

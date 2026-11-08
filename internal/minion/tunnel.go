@@ -317,11 +317,6 @@ func (r *Runner) reverse(ctx context.Context, t *Task, args protocol.Args) {
 		r.End(t, false, nil, "tunnels go over a connection that stays open (bind-persistent), not a call")
 		return
 	}
-	if udp, _ := protocol.ArgBool(args, ArgReverseUDP); udp {
-		r.tun.close(t.id)
-		r.End(t, false, nil, "SSH forwards TCP alone: no UDP listener")
-		return
-	}
 	bind, ok := protocol.ArgString(args, ArgReverseBind)
 	if !ok || bind == "" {
 		bind = "0.0.0.0"

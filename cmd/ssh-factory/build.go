@@ -170,10 +170,6 @@ var buildSchema = protocol.BuildSchema{
 					Description: "The address the server listens on: 0.0.0.0 for all of its own (as its GatewayPorts allows: else its loopback), 127.0.0.1 for itself alone."},
 				{Key: "listen", Num: minion.ArgReverseListen, Type: protocol.FieldInt, Label: "Listen port", Required: true, Min: 0, Max: 65535, Order: 2,
 					Description: "The port on the server: 0 for any free one. One under 1024 needs a root login."},
-				// The action's own param: SSH forwards TCP alone, and core
-				// refuses udp on a command that opens none (its Opens).
-				{Key: "udp", Num: minion.ArgReverseUDP, Type: protocol.FieldBool, Label: "UDP", Default: false, Order: 3,
-					Description: "Not over SSH: it forwards TCP alone. Leave it off."},
 				{Key: "timeout", Num: minion.ArgReverseTimeout, Type: protocol.FieldDuration, Label: "Connect timeout", Default: "10s", Order: 10, Advanced: true,
 					Description: "How long core tries to connect to a destination; a connection to the server waits that long, and 30 s more, for it."},
 				{Key: "max_streams", Num: minion.ArgReverseMaxStreams, Type: protocol.FieldInt, Label: "Connections at once", Default: 256, Min: 1, Max: 4096,

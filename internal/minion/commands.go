@@ -88,7 +88,6 @@ const (
 	ArgReverseListen     = 2
 	ArgReverseTimeout    = 3
 	ArgReverseMaxStreams = 4
-	ArgReverseUDP        = 5
 
 	ArgShellCommand = 1
 	ArgShellTimeout = 2
