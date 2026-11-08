@@ -29,7 +29,8 @@ Two programs, one image:
   connection's socket to core, and the minion speaks first, as a listening
   minion does: its hello, alone, under the id the open gives (the target's
   open session's, else the build's: the minion keeps no ids of its own).
-  From then on it runs core's tasks as they come, up to 4 at once. The connection lives as long as
+  From then on it runs core's tasks as they come, up to 4 at once (tunnels
+  besides: they run until stopped). The connection lives as long as
   both the socket and the SSH connection; a keepalive finds a server gone
   quiet. Its commands run inside the SSH connection and go with it: back
   over a new one, core's `reack` (which tasks it still has) gets
@@ -52,10 +53,33 @@ Two programs, one image:
 process group), `ls` (2), `walk` (3: depth first across calls; `one_fs` by
 the server's mount table, as SFTP says no file systems), `download` (4),
 `stream_download` (5), `upload` (6), `stream_upload` (7), `rm` (8), `volumes`
-(9: `df -kPT`, else `df -kP`). The hello says the server as `uname -snm` and
+(9: `df -kPT`, else `df -kP`), `become` (10: shell commands from then on as
+another user, through sudo or su) and `unbecome` (11), `tunnel` (12) and
+`reverse_tunnel` (13), below. The hello says the server as `uname -snm` and
 `id` say it, its machine id (`/etc/machine-id` over SFTP, else the SHA-256 of
 its host key: source `ssh-host-key`), pid 0, and `x.ssh_server`,
 `x.host_key`.
+
+**Tunnels** (`bind-persistent` only; docs: `contracts/agentless-channels`,
+Tunnels): the channel runs core's tunnel items itself, each stream over the
+session's own SSH connection, as `ssh -L`, `-D` and `-R` do, so core's fronts
+(SOCKS, HTTP proxy, forward, terminal, VPN) work as they do with BOB's. A
+TCP stream is a `direct-tcpip` channel (TLS on top, the channel's), a unix
+socket OpenSSH's `direct-streamlocal`, a terminal a session of its own (a pty
+of the open's size when the server gives one, else pipes: the program, or
+the login's shell; Ctrl-C written in for an interrupt, terminate and kill to
+its whole session), SOCKS5 `BIND` and `reverse_tunnel` a remote forward
+(`tcpip-forward`: on the server's loopback unless its `GatewayPorts` lets it
+listen where asked). No UDP and no ICMP: SSH carries neither. Everything runs
+as the login (a become elevates shell commands alone), within what the
+server's `AllowTcpForwarding`, `PermitOpen` and `AllowStreamLocalForwarding`
+allow, its refusals read as tunnel results (`denied`, `refused`, `host
+unreachable`, ...). Tunnels end with the connection: core then gets
+`unknown_task` for them and ends them. Windows's OpenSSH (checked against
+9.5): a terminal is a ConPTY, an interrupt Ctrl-C, terminate and kill SSH's
+`KILL` (the process tree ends); its terminals say exit 0 whatever the shell
+exits with (pipes say the code); a port that refuses opens after about 2 s
+and ends at once; a unix socket's forward fails (`open failed`).
 
 Windows servers (Windows's OpenSSH: its version says `OpenSSH_for_Windows`,
 its SFTP a drive's folders, `/C:/Users/me`) are served as BOB's minion runs on
@@ -110,7 +134,9 @@ docker compose up -d --build
 
 The tests log in to an SSH server in the test's own process
 (`internal/sshtest`: password and key logins, `/bin/sh` commands in process
-groups of their own, SFTP; `NewWindows` answers as Windows's OpenSSH does:
+groups of their own, SFTP, forwards (`direct-tcpip`, `direct-streamlocal`,
+`tcpip-forward`) and, on Linux, terminals (`pty-req`, `window-change`);
+`NewWindows` answers as Windows's OpenSSH does:
 its version, SFTP with `C:` at its root and a link to a folder read as a
 junction, commands a test's `Exec` answers, stopped by a signal), so they
 need no server and run on Unix.

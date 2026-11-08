@@ -91,6 +91,9 @@ type Config struct {
 	// when the connection opened (an open's acting): nil, the process's
 	// own.
 	Acting []byte
+	// Tunnels is what the tunnel tasks' streams go over: the session's
+	// SSH connection; nil, none (a tunnel task fails).
+	Tunnels Tunneler
 }
 
 // Runner holds the tasks of a session and what the next message says.
@@ -143,6 +146,8 @@ type Runner struct {
 	persistent  bool
 	// exec carries out a task's command: run, but in tests.
 	exec func(ctx context.Context, t *Task, ti protocol.TaskItem)
+	// tun are the tunnel tasks' streams (tunnel.go).
+	tun *tunnels
 }
 
 // NewRunner is a runner for a session, with nothing to send yet.
@@ -153,8 +158,24 @@ func NewRunner(cfg Config) *Runner {
 	}
 	done := make(chan struct{})
 	close(done)
-	return &Runner{host: cfg.Host, ops: cfg.Ops, feedback: cfg.Feedback, logf: logf, said: cfg.Acting, lane: done,
+	r := &Runner{host: cfg.Host, ops: cfg.Ops, feedback: cfg.Feedback, logf: logf, said: cfg.Acting, lane: done,
 		seen: map[string]time.Time{}, wake: make(chan struct{}, 1), hello: cfg.Hello, maxTasks: min(cfg.MaxTasks, protocol.MaxTasksLimit)}
+	r.tun = newTunnels(r.Nudge, cfg.Tunnels, logf)
+	return r
+}
+
+// Close ends the session's tasks and the tunnels' streams: the session's
+// connection went, and a task that runs until cancelled (a tunnel) would
+// wait for good.
+func (r *Runner) Close() {
+	r.mu.Lock()
+	for _, t := range r.tasks {
+		if !t.ended {
+			t.cancel()
+		}
+	}
+	r.mu.Unlock()
+	r.tun.closeAll()
 }
 
 // SetLimit says the largest message the connection in use carries.
@@ -225,7 +246,7 @@ func (r *Runner) Pending() bool {
 			return true
 		}
 	}
-	return false
+	return r.tun.pending()
 }
 
 // Outgoing is the next message's items: the failed message's again, or a
@@ -328,6 +349,15 @@ parts:
 			}
 		}
 	}
+	// The tunnels' items (tunnel.go): half the room left while a file
+	// goes too.
+	tunRoom := room
+	if slices.ContainsFunc(r.tasks, func(t *Task) bool { return t.xfer.sending() }) {
+		tunRoom = room / 2
+	}
+	tun, used := r.tun.items(tunRoom, tunnelMaxItems)
+	items = append(items, tun...)
+	room = max(room-used, 0)
 	// A file's next chunk, one per message, in the room left.
 	for _, t := range r.tasks {
 		if !t.xfer.sending() || room == 0 {
@@ -367,11 +397,12 @@ parts:
 }
 
 // roomLocked is how many more tasks the limit leaves room for: the limit
-// less the tasks whose end has not gone yet.
+// less the tasks whose end has not gone yet. A tunnel task is not one of
+// them: it runs until cancelled, beside the tasks.
 func (r *Runner) roomLocked() uint64 {
 	running := uint64(0)
 	for _, t := range r.tasks {
-		if !t.sentEnd {
+		if !t.sentEnd && !tunnelCmd(r.ops[t.cmd]) {
 			running++
 		}
 	}
@@ -467,6 +498,15 @@ func (r *Runner) Take(answer protocol.CoreMessage, sent []any) {
 				continue
 			}
 			r.reack(rk.Tasks, i)
+		case protocol.ItemTunnel, protocol.ItemTunnelReply, protocol.ItemTunnelData, protocol.ItemTunnelAck, protocol.ItemTunnelClose,
+			protocol.ItemTunnelDatagram, protocol.ItemTunnelCtl:
+			// A tunnel's stream: opened (by core, or core's answer to one
+			// the minion opened), its bytes, how far core has the server's,
+			// its controls (a terminal's size, a signal), its end
+			// (tunnel.go).
+			if err := r.tun.take(raw); err != nil {
+				r.queueErr(protocol.ErrItemBadMessage, protocol.ItemName(protocol.ItemType(raw))+": "+err.Error(), i)
+			}
 		case protocol.ItemPoll:
 			// Come back sooner than the schedule: a stream of the minion's
 			// may go on any moment.
@@ -547,8 +587,13 @@ func (r *Runner) acked(xfer []byte, next uint64, hold bool) {
 // persistent connection core pushes instead, and asks for none.
 func (r *Runner) PollEvery() time.Duration {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.poll
+	p := r.poll
+	r.mu.Unlock()
+	// A tunnel's stream sends again unasked (from its ack, a probe).
+	if d, due := r.tun.due(); due && (p == 0 || d < p) {
+		p = max(d, time.Millisecond)
+	}
+	return p
 }
 
 // refused ends a transfer core does not take, or does not send.
@@ -628,6 +673,13 @@ func (r *Runner) start(ti protocol.TaskItem) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Task{id: ti.Task, cmd: ti.Cmd, cancel: cancel, said: r.said}
 	r.tasks = append(r.tasks, t)
+	if tunnelCmd(cmd) {
+		// Its tunnel now, before its ack goes: core opens streams in it
+		// once it has the ack. A proxy and a forward are the same to the
+		// minion: core says each stream's destination. A reverse forward's
+		// streams are the minion's, opened once the server listens.
+		r.tun.open(ctx, ti.Task, cmd, ti.Args)
+	}
 	// In the lane: after the task before it there has what it runs as.
 	var wait chan struct{}
 	if switching || becomes(cmd) {
@@ -821,6 +873,10 @@ func (r *Runner) run(ctx context.Context, t *Task, ti protocol.TaskItem) {
 		r.become(ctx, t, ti.Args)
 	case CmdUnbecome:
 		r.unbecome(t)
+	case CmdTunnel:
+		r.runTunnel(ctx, t)
+	case CmdReverseTunnel:
+		r.reverse(ctx, t, ti.Args)
 	default:
 		r.End(t, false, nil, fmt.Sprintf("command %d is not one this minion knows", ti.Cmd))
 	}

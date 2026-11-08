@@ -76,7 +76,9 @@ func (s *session) run() {
 	host := sshhost.New(s.c)
 	feedback := minion.NewFeedback(logf(s.t.Addr))
 	r := minion.NewRunner(minion.Config{Host: host, Ops: ops.Commands, MaxTasks: ops.MaxTasks, Feedback: feedback,
-		Hello: host.Hello, Logf: logf(s.t.Addr), Acting: s.acting})
+		Hello: host.Hello, Logf: logf(s.t.Addr), Acting: s.acting, Tunnels: host})
+	// The tunnels' streams go with the connection.
+	defer r.Close()
 	feedback.SetWake(r.Nudge)
 	r.SetPersistent(true)
 	r.SetLimit(protocol.MaxMinionMessageSize)
@@ -103,6 +105,11 @@ func (s *session) run() {
 	}()
 	keep := time.NewTicker(s.t.Keepalive)
 	defer keep.Stop()
+	// due fires when core's reply is late, or, with no message awaiting
+	// one, when a tunnel's stream sends again unasked (from its ack, a
+	// probe of a shut window).
+	due := time.NewTimer(time.Hour)
+	defer due.Stop()
 	// The minion speaks first: its hello.
 	r.AskHello()
 
@@ -182,6 +189,7 @@ func (s *session) run() {
 				return
 			}
 		case <-r.Wake():
+		case <-due.C:
 		case <-keep.C:
 			if !s.c.Alive(s.t.Keepalive) {
 				s.close("the server did not answer a keepalive")
@@ -189,7 +197,11 @@ func (s *session) run() {
 			}
 		}
 		if inflight != nil {
-			if time.Since(sentAt) < replyWait {
+			if wait := replyWait - time.Since(sentAt); wait > 0 {
+				// One message at a time: nothing goes before core's reply,
+				// which wakes the loop itself. The timer waits it out, never
+				// a tunnel's resend, which would wake the loop for nothing.
+				due.Reset(wait)
 				continue
 			}
 			// No reply: core takes it again as it was.
@@ -199,6 +211,16 @@ func (s *session) run() {
 		if (!spoke || r.Pending()) && !send() {
 			return
 		}
+		// Next: core's reply, within replyWait; with none awaited, a
+		// tunnel's resend (PollEvery), at least a few milliseconds off.
+		next := replyWait
+		if inflight == nil {
+			next = time.Hour
+			if d := r.PollEvery(); d > 0 {
+				next = max(d, 5*time.Millisecond)
+			}
+		}
+		due.Reset(next)
 	}
 }
 

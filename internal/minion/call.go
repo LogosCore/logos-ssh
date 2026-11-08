@@ -295,6 +295,9 @@ func (w *call) run(t protocol.TaskItem) []any {
 		return w.startReceive(t, true)
 	case CmdWalk:
 		return w.startWalk(t)
+	case CmdTunnel, CmdReverseTunnel:
+		// Core sends none through a call (the commands' kinds).
+		return []any{failed(t.Task, "tunnels go over a connection that stays open (bind-persistent), not a call")}
 	}
 	return []any{failed(t.Task, fmt.Sprintf("command %d is not one this minion knows", t.Cmd))}
 }

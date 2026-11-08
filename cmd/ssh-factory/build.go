@@ -134,6 +134,52 @@ var buildSchema = protocol.BuildSchema{
 			ID: "unbecome", Op: ops.Unbecome, Label: "Unbecome", Default: true,
 			Description: "Shell commands run as the login again; the elevated shells close.",
 		},
+		{
+			ID: "tunnel", Op: ops.Tunnel, Label: "Tunnel", Default: true,
+			Description: "Opens a tunnel through the SSH server on one of core's operational ports: a SOCKS proxy, an HTTP proxy, a port forward, a terminal or a VPN, as its front says. " +
+				"Each connection a tool makes through it, the server makes (SSH's port forwarding: its AllowTcpForwarding and PermitOpen decide); a terminal's, the login's shell (or the program it says) in a terminal on the server. " +
+				"TCP only: SSH carries no UDP and no ping. Over a connection that stays open (bind-persistent); it runs until stopped, or until that connection drops.",
+			Action: protocol.ActionTunnel,
+			Kinds:  []string{protocol.KindBindPersistent},
+			// TCP connections (direct-tcpip; TLS on top, the minion's), unix
+			// sockets (OpenSSH's direct-streamlocal), processes (a session
+			// with a pty, else pipes) and accepts (SOCKS BIND: a remote
+			// forward for one connection).
+			Opens: []string{protocol.OpenTCP, protocol.OpenUnix, protocol.OpenTLS, protocol.OpenProcess, protocol.OpenAccept},
+			// Core adds the front, the port, a forward's destination, when it
+			// stops the tunnel idle and the bandwidth cap
+			// (protocol.TunnelCoreParams): no num, never sent.
+			Params: []protocol.FieldSpec{
+				{Key: "timeout", Num: minion.ArgTunnelTimeout, Type: protocol.FieldDuration, Label: "Connect timeout", Default: "10s", Order: 10, Advanced: true,
+					Description: "How long the server tries to connect to a destination.",
+					When: &protocol.FieldCondition{Key: protocol.ParamFront,
+						Values: []string{protocol.FrontSOCKS, protocol.FrontHTTP, protocol.FrontForward, protocol.FrontVPN}}},
+				{Key: "max_streams", Num: minion.ArgTunnelMaxStreams, Type: protocol.FieldInt, Label: "Connections at once", Default: 256, Min: 1, Max: 4096,
+					Order: 11, Advanced: true, Description: "How many of the tools' connections the tunnel carries at once."},
+			},
+		},
+		{
+			ID: "reverse_tunnel", Op: ops.ReverseTunnel, Label: "Reverse tunnel", Default: true,
+			Description: "Has the SSH server listen on a TCP port (a remote forward): each connection to it, core connects to a destination from its own network (an operator's handler, a server core reaches). " +
+				"The server listens on its loopback alone unless its GatewayPorts lets it listen where asked. Over a connection that stays open (bind-persistent); it runs until stopped, or until that connection drops.",
+			Action: protocol.ActionReverseTunnel,
+			Kinds:  []string{protocol.KindBindPersistent},
+			Opens:  []string{protocol.OpenTCP},
+			Params: []protocol.FieldSpec{
+				{Key: "bind", Num: minion.ArgReverseBind, Type: protocol.FieldString, Label: "Listen address", Default: "0.0.0.0", MaxLength: 255, Order: 1,
+					Description: "The address the server listens on: 0.0.0.0 for all of its own (as its GatewayPorts allows: else its loopback), 127.0.0.1 for itself alone."},
+				{Key: "listen", Num: minion.ArgReverseListen, Type: protocol.FieldInt, Label: "Listen port", Required: true, Min: 0, Max: 65535, Order: 2,
+					Description: "The port on the server: 0 for any free one. One under 1024 needs a root login."},
+				// The action's own param: SSH forwards TCP alone, and core
+				// refuses udp on a command that opens none (its Opens).
+				{Key: "udp", Num: minion.ArgReverseUDP, Type: protocol.FieldBool, Label: "UDP", Default: false, Order: 3,
+					Description: "Not over SSH: it forwards TCP alone. Leave it off."},
+				{Key: "timeout", Num: minion.ArgReverseTimeout, Type: protocol.FieldDuration, Label: "Connect timeout", Default: "10s", Order: 10, Advanced: true,
+					Description: "How long core tries to connect to a destination; a connection to the server waits that long, and 30 s more, for it."},
+				{Key: "max_streams", Num: minion.ArgReverseMaxStreams, Type: protocol.FieldInt, Label: "Connections at once", Default: 256, Min: 1, Max: 4096,
+					Order: 11, Advanced: true, Description: "How many connections the tunnel carries at once: one past it is closed."},
+			},
+		},
 	},
 }
 

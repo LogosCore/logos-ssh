@@ -48,6 +48,13 @@ const (
 	CmdBecome
 	// CmdUnbecome: shell commands run as the login again.
 	CmdUnbecome
+	// CmdTunnel is a tunnel core puts its fronts in front of (SOCKS, an
+	// HTTP proxy, a port forward, a terminal, a VPN): streams through the
+	// session's SSH connection, until cancelled (tunnel.go).
+	CmdTunnel
+	// CmdReverseTunnel listens on the server (a remote forward) and opens
+	// a stream to core for each connection that comes.
+	CmdReverseTunnel
 )
 
 // The commands' params, by number (num).
@@ -73,6 +80,15 @@ const (
 	ArgWalkMaxFolders = 3
 	ArgWalkHidden     = 4
 	ArgWalkOneFS      = 5
+
+	ArgTunnelTimeout    = 2
+	ArgTunnelMaxStreams = 3
+
+	ArgReverseBind       = 1
+	ArgReverseListen     = 2
+	ArgReverseTimeout    = 3
+	ArgReverseMaxStreams = 4
+	ArgReverseUDP        = 5
 
 	ArgShellCommand = 1
 	ArgShellTimeout = 2

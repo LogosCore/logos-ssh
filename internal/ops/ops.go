@@ -18,6 +18,8 @@ const (
 	Volumes        = 9
 	Become         = 10
 	Unbecome       = 11
+	Tunnel         = 12
+	ReverseTunnel  = 13
 )
 
 // Commands are the minion's commands by number: the factory builds them
@@ -26,13 +28,15 @@ var Commands = map[uint64]minion.Command{
 	Shell: minion.CmdShell, Ls: minion.CmdLs, Walk: minion.CmdWalk, Download: minion.CmdDownload,
 	StreamDownload: minion.CmdStreamDownload, Upload: minion.CmdUpload, StreamUpload: minion.CmdStreamUpload,
 	Rm: minion.CmdRm, Volumes: minion.CmdVolumes, Become: minion.CmdBecome, Unbecome: minion.CmdUnbecome,
+	Tunnel: minion.CmdTunnel, ReverseTunnel: minion.CmdReverseTunnel,
 }
 
 // Numbers are the commands' numbers, in order.
 func Numbers() []uint64 {
-	return []uint64{Shell, Ls, Walk, Download, StreamDownload, Upload, StreamUpload, Rm, Volumes, Become, Unbecome}
+	return []uint64{Shell, Ls, Walk, Download, StreamDownload, Upload, StreamUpload, Rm, Volumes, Become, Unbecome, Tunnel, ReverseTunnel}
 }
 
 // MaxTasks is how many tasks the minion runs at once: a call brings this
-// many at most, and a persistent connection's allowance is this.
+// many at most, and a persistent connection's allowance is this. Tunnel
+// tasks are not counted: they run beside the others until stopped.
 const MaxTasks = 4

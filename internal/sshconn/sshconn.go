@@ -497,3 +497,41 @@ type bufferedConn struct {
 }
 
 func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+// Dial connects to address from the server (network "tcp": direct-tcpip,
+// host:port; "unix": OpenSSH's direct-streamlocal, a socket's path),
+// within ctx: the server connects as slowly as its destination answers, so
+// OpenWait does not bound it, nor does it close the connection. It gives up
+// with the connection too. A refusal is an *ssh.OpenChannelError.
+func (c *Conn) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-c.closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	conn, err := c.SSH.DialContext(ctx, network, address)
+	if err != nil && c.isClosed() {
+		return nil, fmt.Errorf("a connection to %s: %w", address, ErrClosed)
+	}
+	return conn, err
+}
+
+// Listen has the server listen at a tcp address (a remote forward,
+// tcpip-forward: on the server's loopback unless its GatewayPorts lets it
+// listen where asked; port 0, one it picks), within OpenWait.
+func (c *Conn) Listen(network, address string) (net.Listener, error) {
+	return open(c, "a remote forward", func() (net.Listener, error) { return c.SSH.Listen(network, address) })
+}
+
+func (c *Conn) isClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
+}

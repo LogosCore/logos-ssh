@@ -121,6 +121,20 @@ func checkItems(t *testing.T, m protocol.MinionMessage) {
 			err = validated(raw, protocol.ErrItem.Validate)
 		case protocol.ItemIdentity:
 			err = validated(raw, protocol.IdentityItem.Validate)
+		case protocol.ItemTunnel:
+			_, err = protocol.ReadTunnel(raw)
+		case protocol.ItemTunnelReply:
+			err = validated(raw, protocol.TunnelReplyItem.Validate)
+		case protocol.ItemTunnelData:
+			err = validated(raw, protocol.TunnelDataItem.Validate)
+		case protocol.ItemTunnelAck:
+			err = validated(raw, protocol.TunnelAckItem.Validate)
+		case protocol.ItemTunnelClose:
+			err = validated(raw, protocol.TunnelCloseItem.Validate)
+		case protocol.ItemTunnelListen:
+			err = validated(raw, protocol.TunnelListenItem.Validate)
+		case protocol.ItemTunnelCtl:
+			err = validated(raw, protocol.TunnelCtlItem.Validate)
 		default:
 			err = errors.New("not an item a minion sends")
 		}

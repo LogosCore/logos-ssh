@@ -3,8 +3,11 @@
 // Package sshtest is an SSH server for tests, in the test's process on
 // 127.0.0.1: it logs in its user by password or by an authorized key, runs
 // commands in /bin/sh (each in a process group of its own, as sshd's
-// sessions run), answers signals and keepalives, and serves SFTP from a
-// folder. NewWindows makes one that answers as Windows's OpenSSH does.
+// sessions run; in a session of its own with a PTY on Linux after a
+// pty-req, a shell too), answers signals and keepalives, serves SFTP from a
+// folder, and forwards: direct-tcpip, direct-streamlocal@openssh.com and
+// tcpip-forward (forwarding.go). NewWindows makes one that answers as
+// Windows's OpenSSH does.
 package sshtest
 
 import (
@@ -15,11 +18,13 @@ import (
 	"github.com/logoscore/logos-golang-protocol/protocol"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -38,6 +43,14 @@ type Server struct {
 
 	// Signals counts the signals commands got.
 	Signals atomic.Int32
+	// NoForward refuses every forward, as AllowTcpForwarding no does;
+	// NoPTY every pty-req (the session runs on pipes); NoUnix every unix
+	// socket's (direct-streamlocal: a server without it says an unknown
+	// channel type).
+	NoForward, NoPTY, NoUnix atomic.Bool
+	// Size is the last size a session's terminal was given (pty-req,
+	// window-change), rows and cols.
+	Size atomic.Value
 
 	ln         net.Listener
 	mu         sync.Mutex
@@ -155,10 +168,17 @@ func (s *Server) serve(nc net.Conn, cfg *ssh.ServerConfig) {
 		return
 	}
 	defer func() { _ = conn.Close() }() // the client went
+	fw := &forwards{s: s, conn: conn, lns: map[string]net.Listener{}}
+	defer fw.closeAll()
 	go func() {
 		for r := range reqs {
-			if r.WantReply {
-				_ = r.Reply(r.Type == "keepalive@openssh.com", nil)
+			switch r.Type {
+			case "tcpip-forward", "cancel-tcpip-forward":
+				fw.request(r)
+			default:
+				if r.WantReply {
+					_ = r.Reply(r.Type == "keepalive@openssh.com", nil)
+				}
 			}
 		}
 	}()
@@ -166,8 +186,13 @@ func (s *Server) serve(nc net.Conn, cfg *ssh.ServerConfig) {
 		if s.Stall.Load() {
 			continue // unanswered: the connection keeps the open pending
 		}
-		if nch.ChannelType() != "session" {
-			_ = nch.Reject(ssh.UnknownChannelType, "sessions only")
+		switch nch.ChannelType() {
+		case "direct-tcpip", "direct-streamlocal@openssh.com":
+			go s.direct(nch)
+			continue
+		case "session":
+		default:
+			_ = nch.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
 		}
 		ch, creqs, err := nch.Accept()
@@ -184,12 +209,61 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	var mu sync.Mutex
 	var cmd *exec.Cmd
 	stop := func() {}
+	// The session's terminal, after a pty-req: its master end.
+	var term *os.File
+	defer func() {
+		if term != nil {
+			_ = term.Close()
+		}
+	}()
 	for r := range reqs {
 		switch r.Type {
-		case "exec":
-			var p struct{ Command string }
-			if ssh.Unmarshal(r.Payload, &p) != nil {
+		case "pty-req":
+			var p struct {
+				Term                      string
+				Cols, Rows, Width, Height uint32
+				Modes                     string
+			}
+			if s.NoPTY.Load() || term != nil || ssh.Unmarshal(r.Payload, &p) != nil {
 				_ = r.Reply(false, nil)
+				continue
+			}
+			m, sl, err := openPTY()
+			if err == nil {
+				err = setSize(m, int(p.Rows), int(p.Cols))
+				_ = sl.Close()
+			}
+			if err != nil {
+				if m != nil {
+					_ = m.Close()
+				}
+				_ = r.Reply(false, nil)
+				continue
+			}
+			term = m
+			s.Size.Store([2]int{int(p.Rows), int(p.Cols)})
+			_ = r.Reply(true, nil)
+		case "window-change":
+			var p struct{ Cols, Rows, Width, Height uint32 }
+			if term != nil && ssh.Unmarshal(r.Payload, &p) == nil && setSize(term, int(p.Rows), int(p.Cols)) == nil {
+				s.Size.Store([2]int{int(p.Rows), int(p.Cols)})
+			}
+		case "shell", "exec":
+			var p struct{ Command string }
+			if r.Type == "exec" && ssh.Unmarshal(r.Payload, &p) != nil {
+				_ = r.Reply(false, nil)
+				continue
+			}
+			if term != nil && s.exec == nil {
+				c, err := s.inTerminal(ch, term, p.Command)
+				if err != nil {
+					_ = r.Reply(false, nil)
+					continue
+				}
+				mu.Lock()
+				cmd = c
+				mu.Unlock()
+				_ = r.Reply(true, nil)
 				continue
 			}
 			if s.exec != nil {
@@ -207,6 +281,9 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 				continue
 			}
 			c := exec.Command("/bin/sh", "-c", p.Command)
+			if r.Type == "shell" {
+				c = exec.Command("/bin/sh")
+			}
 			c.Dir = s.Dir
 			c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			c.Stdout, c.Stderr = ch, ch.Stderr()
@@ -230,23 +307,7 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			mu.Unlock()
 			_ = r.Reply(true, nil)
 			go func() {
-				err := c.Wait()
-				var exitErr *exec.ExitError
-				switch ws, ok := c.ProcessState.Sys().(syscall.WaitStatus); {
-				case ok && ws.Signaled():
-					name := ws.Signal().String()
-					if n, ok := signalNames[ws.Signal()]; ok {
-						name = n
-					}
-					_, _ = ch.SendRequest("exit-signal", false, ssh.Marshal(struct {
-						Signal     string
-						CoreDumped bool
-						Error      string
-						Lang       string
-					}{Signal: name}))
-				case err == nil || errors.As(err, &exitErr):
-					_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(c.ProcessState.ExitCode())})) //nolint:gosec // an exit code
-				}
+				sayExit(ch, c, c.Wait())
 				_ = ch.Close()
 			}()
 		case "subsystem":
@@ -288,6 +349,66 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			}
 		}
 	}
+}
+
+// sayExit tells the client how the command ended: exit-signal, or
+// exit-status.
+func sayExit(ch ssh.Channel, c *exec.Cmd, err error) {
+	var exitErr *exec.ExitError
+	switch ws, ok := c.ProcessState.Sys().(syscall.WaitStatus); {
+	case ok && ws.Signaled():
+		name := ws.Signal().String()
+		if n, ok := signalNames[ws.Signal()]; ok {
+			name = n
+		}
+		_, _ = ch.SendRequest("exit-signal", false, ssh.Marshal(struct {
+			Signal     string
+			CoreDumped bool
+			Error      string
+			Lang       string
+		}{Signal: name}))
+	case err == nil || errors.As(err, &exitErr):
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(c.ProcessState.ExitCode())})) //nolint:gosec // an exit code
+	}
+}
+
+// inTerminal runs command ("": a shell) in the session's terminal, in a
+// session of its own with the terminal its controlling one, as sshd does:
+// the terminal's output to the channel, the channel's bytes to it; once it
+// exited and its output drained, its exit is said and the channel closes.
+func (s *Server) inTerminal(ch ssh.Channel, term *os.File, command string) (*exec.Cmd, error) {
+	pts, err := os.OpenFile(ptsName(term), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = pts.Close() }()
+	c := exec.Command("/bin/sh")
+	if command != "" {
+		c = exec.Command("/bin/sh", "-c", command)
+	}
+	c.Dir = s.Dir
+	c.Env = append(os.Environ(), "TERM=xterm-256color")
+	c.Stdin, c.Stdout, c.Stderr = pts, pts, pts
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	if err := c.Start(); err != nil {
+		return nil, err
+	}
+	drained := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(ch, term) // to EIO, once every end of the terminal closed
+		close(drained)
+	}()
+	go func() { _, _ = io.Copy(term, ch) }()
+	go func() {
+		err := c.Wait()
+		select {
+		case <-drained:
+		case <-time.After(2 * time.Second): // a child kept the terminal open
+		}
+		sayExit(ch, c, err)
+		_ = ch.Close()
+	}()
+	return c, nil
 }
 
 // signalNames are the SSH names of the signals a test sends (RFC 4254,

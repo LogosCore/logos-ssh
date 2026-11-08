@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/logoscore/logos-golang-protocol/protocol"
@@ -687,7 +688,9 @@ type shellOut struct {
 	w    io.Writer
 	head []byte
 	seen bool
-	id   int
+	// id is the process id the mark said: read off the lock, which a
+	// write holds while its reader is slow (a process's stream).
+	id   atomic.Int64
 	mark string
 }
 
@@ -708,7 +711,8 @@ func (o *shellOut) Write(p []byte) (int, error) {
 		line, rest = o.head[:i], o.head[i+1:]
 	}
 	if id, ok := strings.CutPrefix(string(line), o.mark); ok {
-		o.id, _ = strconv.Atoi(strings.TrimSpace(id))
+		n, _ := strconv.Atoi(strings.TrimSpace(id))
+		o.id.Store(int64(n))
 	} else {
 		rest = o.head // no mark: all of it is the command's
 	}
@@ -734,11 +738,7 @@ func (o *shellOut) write(b []byte, n int) (int, error) {
 	return n, nil
 }
 
-func (o *shellOut) pid() int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.id
-}
+func (o *shellOut) pid() int { return int(o.id.Load()) }
 
 // run runs a command line of the channel's own on the server: its output,
 // within wait.
