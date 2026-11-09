@@ -103,7 +103,9 @@ Windows servers.
 ## Config
 
 The channel (`internal/config`): `CHANNEL_ID` (`ssh-local`),
-`LOGOS_CORE_BASE_URL`, `MAX_CONNECTIONS` (persistent ones, 1000),
+`LOGOS_CORE_BASE_URL` (and, over HTTPS to a self-signed core,
+`LOGOS_CORE_CA_FILE`, `LOGOS_CORE_CERT_SHA256` or `LOGOS_CORE_TLS_INSECURE`:
+[How modules reach core](https://logoscore.github.io/logos-docs/core-infrastructure/#how-modules-reach-core)), `MAX_CONNECTIONS` (persistent ones, 1000),
 `CALL_TIMEOUT` (2m, 1s to 10m: how long a call may take, its login and its
 tasks; core's deadline, 2 minutes, wins when shorter), `LOG_FORMAT` (`json`,
 `text`), `RABBITMQ_*`. The factory: `FACTORY_ID`
