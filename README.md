@@ -109,7 +109,9 @@ The channel (`internal/config`): `CHANNEL_ID` (`ssh-local`),
 `CALL_TIMEOUT` (2m, 1s to 10m: how long a call may take, its login and its
 tasks; core's deadline, 2 minutes, wins when shorter), `LOG_FORMAT` (`json`,
 `text`), `RABBITMQ_*`. The factory: `FACTORY_ID`
-(`ssh-factory-local`), `LOG_FORMAT`, `RABBITMQ_*`.
+(`ssh-factory-local`), `LOGOS_CORE_BASE_URL` (the channel's, with the same
+TLS settings: builds upload their description to core), `LOG_FORMAT`,
+`RABBITMQ_*`.
 
 ## Management
 

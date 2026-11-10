@@ -63,6 +63,10 @@ func main() {
 		Build:               &schema,
 		Builder:             sshFactory{},
 		MaxConcurrentBuilds: 8,
+		// Builds fetch their files from core and upload the artifact to it:
+		// core's own address, or its front (logos-nginx). Over HTTPS to a
+		// self-signed core, module-core's LOGOS_CORE_* TLS settings.
+		CoreURL: env("LOGOS_CORE_BASE_URL", "http://localhost:8002"),
 	})
 	if err != nil {
 		fatal("control plane failed", "err", err)

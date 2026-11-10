@@ -45,6 +45,8 @@ services:
     environment:
       <<: *rabbitmq
       FACTORY_ID: ${FACTORY_ID:-ssh-factory-local}
+      # Builds fetch their files from core and upload the artifact to it.
+      LOGOS_CORE_BASE_URL: ${LOGOS_CORE_BASE_URL:-http://logos-core-dev:8002}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     networks:
       - logos
