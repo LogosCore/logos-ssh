@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
 
+env:
+  # Our own modules straight from GitHub, not through the public Go proxy:
+  # a tag builds the moment it is pushed. go.sum still checks them.
+  GOPRIVATE: "github.com/logoscore/*"
+
 jobs:
   test:
     runs-on: ubuntu-latest

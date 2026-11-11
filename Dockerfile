@@ -13,6 +13,11 @@
 ARG BUILDPLATFORM=linux/amd64
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 WORKDIR /src
+# Our own modules come straight from GitHub (git), not through the public Go
+# proxy: a tag builds the moment it is pushed, whatever the proxy has cached.
+# go.sum still checks them.
+ENV GOPRIVATE=github.com/logoscore/*
+RUN apk add --no-cache git
 
 COPY go.mod go.sum ./
 RUN go mod download
