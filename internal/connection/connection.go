@@ -27,7 +27,7 @@ var HostKeyPattern = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{43}=?$`)
 
 // CredentialsField is the target's credentials: keys and passwords from the
 // operation's, tried in order until one logs in.
-var CredentialsField = protocol.FieldSpec{Key: "credentials", Type: protocol.FieldCredentialList, Label: "Credentials",
+var CredentialsField = protocol.FieldSpec{Key: "credentials", Num: 5, Type: protocol.FieldCredentialList, Label: "Credentials",
 	Required: true, MaxItems: MaxLogins, Accept: []string{protocol.CredentialTypeKey, protocol.CredentialTypePlaintext},
 	Group: "Login", Order: 5,
 	Description: "Keys and passwords to log in with, tried in order until one is taken: each as its username " +
@@ -41,19 +41,19 @@ const MaxLogins = 8
 // in.
 func target() []protocol.FieldSpec {
 	return []protocol.FieldSpec{
-		{Key: "host", Type: protocol.FieldString, Label: "Host", Required: true, MaxLength: 255, Group: "Server", Order: 1,
+		{Key: "host", Num: 1, Type: protocol.FieldString, Label: "Host", Required: true, MaxLength: 255, Group: "Server", Order: 1,
 			Description: "The server's address or name.", Placeholder: "10.0.12.7"},
-		{Key: "port", Type: protocol.FieldInt, Label: "Port", Default: 22, Min: 1, Max: 65535, Group: "Server", Order: 2},
-		{Key: "host_key", Type: protocol.FieldString, Label: "Host key", MaxLength: 60, Group: "Server", Order: 3,
+		{Key: "port", Num: 2, Type: protocol.FieldInt, Label: "Port", Default: 22, Min: 1, Max: 65535, Group: "Server", Order: 2},
+		{Key: "host_key", Num: 3, Type: protocol.FieldString, Label: "Host key", MaxLength: 60, Group: "Server", Order: 3,
 			Pattern:     HostKeyPattern.String(),
 			Description: "The server's host key's SHA-256 fingerprint (SHA256:…, as ssh-keygen -l prints it): the server must present it. Empty: the first key it presents is taken, and its session shows it to pin here."},
-		{Key: "user", Type: protocol.FieldString, Label: "User", MaxLength: 255, Group: "Login", Order: 4,
+		{Key: "user", Num: 4, Type: protocol.FieldString, Label: "User", MaxLength: 255, Group: "Login", Order: 4,
 			Description: "Who a credential without a username logs in as."},
 		CredentialsField,
-		{Key: "proxy", Type: protocol.FieldURL, Label: "Proxy", MaxLength: 2048, Group: "Network", Order: 8,
+		{Key: "proxy", Num: 6, Type: protocol.FieldURL, Label: "Proxy", MaxLength: 2048, Group: "Network", Order: 8,
 			Pattern:     `^(socks5|socks5h|http)://[^\s]+$`,
 			Description: "Reach the server through a proxy: socks5://host:port (a pivot, an SSH dynamic forward) or http://host:port (CONNECT)."},
-		{Key: "connect_timeout", Type: protocol.FieldDuration, Label: "Connect timeout", Default: "10s", Min: "1s", Max: "2m", Group: "Network", Order: 9,
+		{Key: "connect_timeout", Num: 7, Type: protocol.FieldDuration, Label: "Connect timeout", Default: "10s", Min: "1s", Max: "2m", Group: "Network", Order: 9,
 			Description: "How long reaching the server and logging in may take."},
 	}
 }
@@ -67,7 +67,7 @@ func Schema() protocol.ConnectionSchema {
 			protocol.KindBindCall: {
 				Agentless: true,
 				Fields: []protocol.FieldSpec{{
-					Key: "call_reuse", Type: protocol.FieldDuration, Label: "Keep the login", Default: "30s", Min: "0s", Max: "10m",
+					Key: "call_reuse", Num: 8, Type: protocol.FieldDuration, Label: "Keep the login", Default: "30s", Min: "0s", Max: "10m",
 					Group: "Calls", Order: 1,
 					Description: "How long the channel keeps a server's SSH connection after a call, for the next one (a file goes a chunk a call). 0s logs in for every call.",
 				}},
@@ -76,7 +76,7 @@ func Schema() protocol.ConnectionSchema {
 			protocol.KindBindPersistent: {
 				Agentless: true,
 				Fields: []protocol.FieldSpec{{
-					Key: "keepalive", Type: protocol.FieldDuration, Label: "Keepalive", Default: "30s", Min: "5s", Max: "1h",
+					Key: "keepalive", Num: 9, Type: protocol.FieldDuration, Label: "Keepalive", Default: "30s", Min: "5s", Max: "1h",
 					Group: "Connection", Order: 1,
 					Description: "How often the channel checks the server is still there: a connection gone without a word is found.",
 				}},

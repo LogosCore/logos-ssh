@@ -95,3 +95,20 @@ func TestReadTarget(t *testing.T) {
 		}
 	}
 }
+
+// Every field has a number, the targets' sharing the kinds' numbering: each
+// stays its field's, the same in both kinds (docs: minion-connection, Field
+// numbers).
+func TestFieldNumbers(t *testing.T) {
+	want := map[string]int{
+		"host": 1, "port": 2, "host_key": 3, "user": 4, "credentials": 5, "proxy": 6, "connect_timeout": 7,
+		"call_reuse": 8, "keepalive": 9,
+	}
+	for kind, k := range Schema().Kinds {
+		for _, f := range append(append([]protocol.FieldSpec{}, k.Fields...), k.Target...) {
+			if f.Num != want[f.Key] {
+				t.Errorf("%s: %s is %d, want %d", kind, f.Key, f.Num, want[f.Key])
+			}
+		}
+	}
+}

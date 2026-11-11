@@ -22,7 +22,7 @@ var buildSchema = protocol.BuildSchema{
 	SchemaVersion: protocol.BuildSchemaV3,
 	Version:       1,
 	Channels: []protocol.BuildChannel{{
-		ModuleName: channelModule, Versions: []int{connection.Version},
+		ModuleName: channelModule, Num: 1, Versions: []int{connection.Version},
 		Kinds: []protocol.BuildKind{{Kind: protocol.KindBindCall}, {Kind: protocol.KindBindPersistent}},
 	}},
 	Crypto: protocol.CryptoAES256CBCHMACSHA256,
