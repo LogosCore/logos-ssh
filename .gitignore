@@ -4,4 +4,10 @@
 # Compiled binaries
 /ssh-channel
 /ssh-factory
+
+# Dev only: a workspace on local checkouts, host-built binaries and the
+# compose override that runs them (docs: Contributing, Development Stack)
+go.work
+go.work.sum
+docker-compose.override.yml
 .dev-bin/
