@@ -417,8 +417,17 @@ func TestWindowsShell(t *testing.T) {
 	if _, err := h.Shell(ctx, "block", &out); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("a stopped command: %v", err)
 	}
-	if srv.Signals.Load() == 0 || time.Since(start) > 2*time.Second || out.String() != "waiting\r\n" {
-		t.Fatalf("signals %d, took %s, out %q", srv.Signals.Load(), time.Since(start), out.String())
+	if took := time.Since(start); took > 2*time.Second || out.String() != "waiting\r\n" {
+		t.Fatalf("took %s, out %q", took, out.String())
+	}
+	// The server counts the signal as it takes the request, which can be
+	// after the session's close reached the client: Shell does not wait for
+	// it.
+	for deadline := time.Now().Add(2 * time.Second); srv.Signals.Load() == 0 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.Signals.Load() == 0 {
+		t.Fatal("no signal reached the server")
 	}
 	if slices.ContainsFunc(w.ran, func(c string) bool { return strings.Contains(c, "/bin/sh") }) {
 		t.Fatalf("ran %q", w.ran)
