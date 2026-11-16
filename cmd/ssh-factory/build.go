@@ -146,14 +146,15 @@ var buildSchema = protocol.BuildSchema{
 			// with a pty, else pipes) and accepts (SOCKS BIND: a remote
 			// forward for one connection).
 			Opens: []string{protocol.OpenTCP, protocol.OpenUnix, protocol.OpenTLS, protocol.OpenProcess, protocol.OpenAccept},
-			// Core adds the front, the port, a forward's destination, when it
-			// stops the tunnel idle and the bandwidth cap
-			// (protocol.TunnelCoreParams): no num, never sent.
+			// Core adds the front, the port, a forward's or a desktop's
+			// destination (and a desktop's login), when it stops the tunnel
+			// idle and the bandwidth cap (protocol.TunnelCoreParams): no
+			// num, never sent.
 			Params: []protocol.FieldSpec{
 				{Key: "timeout", Num: minion.ArgTunnelTimeout, Type: protocol.FieldDuration, Label: "Connect timeout", Default: "10s", Order: 10, Advanced: true,
 					Description: "How long the server tries to connect to a destination.",
 					When: &protocol.FieldCondition{Key: protocol.ParamFront,
-						Values: []string{protocol.FrontSOCKS, protocol.FrontHTTP, protocol.FrontForward, protocol.FrontVPN}}},
+						Values: append([]string{protocol.FrontSOCKS, protocol.FrontHTTP, protocol.FrontForward, protocol.FrontVPN}, protocol.DesktopFronts()...)}},
 				{Key: "max_streams", Num: minion.ArgTunnelMaxStreams, Type: protocol.FieldInt, Label: "Connections at once", Default: 256, Min: 1, Max: 4096,
 					Order: 11, Advanced: true, Description: "How many of the tools' connections the tunnel carries at once."},
 			},
