@@ -11,7 +11,7 @@ import (
 	"github.com/logoscore/logos-golang-protocol/protocol"
 )
 
-// Becoming another user (docs: contracts/agentless-channels/, SSH: become):
+// Becoming another user (README: Become):
 // a host whose shell commands can run as another user, through sudo or su,
 // in shells it keeps elevated on its connection (sshhost, on a Unix
 // server). The become command elevates the session: shell commands from

@@ -15,9 +15,9 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Becoming another user on a Unix server (docs: contracts/agentless-channels/,
-// SSH: become). An SSH connection stays its login's: every channel sshd opens
-// on it runs as the login. So a become keeps shells elevated on the
+// Becoming another user on a Unix server (README: Become). An SSH
+// connection stays its login's: every channel sshd opens on it runs as the
+// login. So a become keeps shells elevated on the
 // connection: each one sudo or su started once (a root shell, say), which the
 // minion writes shell commands into, one at a time each, as a person types
 // into the shell sudo su gave them. One lives on a connection: shell

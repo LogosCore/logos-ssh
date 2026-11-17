@@ -17,7 +17,7 @@ import (
 )
 
 // The Host as a minion.Tunneler: tunnels' streams over the session's SSH
-// connection (docs: contracts/minion-messages/tunnels.md, the SSH channel).
+// connection (README: Tunnels).
 // A forward is a direct-tcpip channel (direct-streamlocal for a unix
 // socket), a remote forward a tcpip-forward, a process a session of its
 // own: in a pty when the open gives a size and the server gives one, else

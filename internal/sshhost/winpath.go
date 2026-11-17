@@ -2,7 +2,7 @@ package sshhost
 
 import "strings"
 
-// Windows paths (docs: contracts/agentless-channels/, Windows servers): core
+// Windows paths (README: Windows servers): core
 // and the minion's commands have them as Windows writes them (C:\Users\me,
 // \\server\share\x), as BOB's minion says them on Windows, and Windows's
 // OpenSSH serves SFTP with each drive a folder of its root (/C:/Users/me).

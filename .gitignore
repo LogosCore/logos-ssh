@@ -6,7 +6,7 @@
 /ssh-factory
 
 # Dev only: a workspace on local checkouts, host-built binaries and the
-# compose override that runs them (docs: Contributing, Development Stack)
+# compose override that runs them (README: Development)
 go.work
 go.work.sum
 docker-compose.override.yml

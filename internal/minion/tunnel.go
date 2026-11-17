@@ -19,7 +19,7 @@ import (
 	"github.com/logoscore/logos-golang-protocol/protocol"
 )
 
-// Tunnels (docs: contracts/agentless-channels, Tunnels; the items:
+// Tunnels (README: Tunnels; the items: docs
 // contracts/minion-messages/tunnels): the SSH minion's, over the session's
 // SSH connection, as `ssh -L`, `-D`, `-R` and `-t` are. The tunnel command
 // runs until core cancels it, and while it runs core opens streams in it,

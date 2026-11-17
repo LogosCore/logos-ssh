@@ -13,7 +13,7 @@ import (
 	"github.com/logoscore/logos-golang-protocol/protocol"
 )
 
-// A Windows server (docs: contracts/agentless-channels/, Windows servers):
+// A Windows server (README: Windows servers):
 // Windows's OpenSSH, whose SFTP says a drive's folders (/C:/Users/me) and
 // which runs a command line in the server's default shell (cmd.exe /c,
 // unless an administrator chose another). What the minion asks of the
