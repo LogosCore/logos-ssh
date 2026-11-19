@@ -27,6 +27,17 @@ type coreSide interface {
 // before it sends it again.
 const replyWait = time.Minute
 
+// sideBatch is how long a side message waits for more to carry: a stream's
+// ack and its server's answer, a moment later, in one.
+var sideBatch = 5 * time.Millisecond
+
+// sideMessage is a side message waiting for its reply: its items, and when
+// it went.
+type sideMessage struct {
+	items []any
+	at    time.Time
+}
+
 // session is a persistent connection (docs: contracts/agentless-channels/,
 // bind-persistent): the minion runs its tasks on the server for as long as
 // both the socket to core and the SSH connection are open, and the
@@ -121,25 +132,60 @@ func (s *session) run() {
 	var sent []any
 	var sentAt time.Time
 	spoke := false
-	send := func() bool {
-		items := r.Outgoing()
+	// write seals items in a message of the minion's and sends it: its id;
+	// nil when the connection ends.
+	write := func(items []any) []byte {
 		msgID, b, err := minion.Message(nil, items)
 		if err != nil {
 			s.close("a message does not encode: " + err.Error())
-			return false
+			return nil
 		}
 		frame, err := protocol.SealFrame(s.keys, [16]byte(id), protocol.FrameMinionToCore, b)
 		if err != nil {
 			s.close("a message does not seal: " + err.Error())
-			return false
+			return nil
 		}
 		if err := s.core.Send(context.Background(), protocol.ConnFrame{ID: id, Data: frame}); err != nil {
-			r.Failed(items)
 			s.close("send to core: " + err.Error())
+			return nil
+		}
+		return msgID
+	}
+	send := func() bool {
+		items := r.Outgoing()
+		msgID := write(items)
+		if msgID == nil {
+			r.Failed(items)
 			return false
 		}
 		inflight, sent, sentAt, spoke = msgID, items, time.Now(), true
 		return true
+	}
+	// Side messages (BOB's minion's ways): while the session's own message
+	// waits for core's reply, the tunnels' items go in messages of their
+	// own, as many as there is to send (the streams' windows bound the
+	// bytes), what came over sideBatch in one; only once core answered the
+	// hello (they go under the session id). Over a slow link to core every
+	// byte a server wrote meanwhile would otherwise wait a round trip for
+	// that reply. sides are those waiting for their replies, by id: core
+	// replies to each, in order. A side message whose reply never comes
+	// needs nothing back: the streams send again from their acks.
+	sides := map[string]sideMessage{}
+	sideReady := false
+	var batch *time.Timer
+	var batchC <-chan time.Time
+	sendSides := func() bool {
+		for {
+			items := r.StreamItems()
+			if len(items) == 0 {
+				return true
+			}
+			msgID := write(items)
+			if msgID == nil {
+				return false
+			}
+			sides[string(msgID)] = sideMessage{items: items, at: time.Now()}
+		}
 	}
 	for {
 		select {
@@ -164,7 +210,9 @@ func (s *session) run() {
 				continue
 			}
 			var answered []any
-			if msg.Re != nil && inflight != nil && bytes.Equal(msg.Re, inflight) {
+			side, isSide := sides[string(msg.Re)]
+			switch {
+			case msg.Re != nil && inflight != nil && bytes.Equal(msg.Re, inflight):
 				answered = sent
 				r.Delivered()
 				r.Take(msg, sent)
@@ -172,7 +220,16 @@ func (s *session) run() {
 				if sid := sessionID(msg); sid != nil {
 					id = sid
 				}
-			} else {
+				// Core answered the session's message (the hello first):
+				// side messages may go, under the id it gave.
+				sideReady = true
+			case msg.Re != nil && isSide:
+				// A side message's reply: its items only (the session's
+				// own message still waits for its own).
+				delete(sides, string(msg.Re))
+				answered = side.items
+				r.Take(msg, side.items)
+			default:
 				r.Take(msg, nil)
 			}
 			// Core's refusals, said: one of the hello leaves the minion
@@ -190,6 +247,11 @@ func (s *session) run() {
 			}
 		case <-r.Wake():
 		case <-due.C:
+		case <-batchC:
+			batch, batchC = nil, nil
+			if inflight != nil && !sendSides() {
+				return
+			}
 		case <-keep.C:
 			if !s.c.Alive(s.t.Keepalive) {
 				s.close("the server did not answer a keepalive")
@@ -198,15 +260,36 @@ func (s *session) run() {
 		}
 		if inflight != nil {
 			if wait := replyWait - time.Since(sentAt); wait > 0 {
-				// One message at a time: nothing goes before core's reply,
-				// which wakes the loop itself. The timer waits it out, never
-				// a tunnel's resend, which would wake the loop for nothing.
-				due.Reset(wait)
+				// One message of the session's own at a time: nothing of its
+				// own goes before core's reply, which wakes the loop itself.
+				// Meanwhile the tunnels' items go in side messages, a batch
+				// later; the timer also wakes the loop for a tunnel's resend
+				// (PollEvery), which one carries.
+				if sideReady && batchC == nil && r.StreamsPending() {
+					batch = time.NewTimer(sideBatch)
+					batchC = batch.C
+				}
+				next := wait
+				if d := r.PollEvery(); sideReady && d > 0 {
+					next = min(next, max(d, sideBatch))
+				}
+				due.Reset(next)
 				continue
 			}
-			// No reply: core takes it again as it was.
+			// No reply: core takes it again as it was; side messages as old
+			// get none either (their streams send again from their acks).
 			r.Failed(sent)
 			inflight, sent = nil, nil
+			for k, sm := range sides {
+				if time.Since(sm.at) >= replyWait {
+					delete(sides, k)
+				}
+			}
+		}
+		if batch != nil {
+			// The session's own message takes what the batch gathered.
+			batch.Stop()
+			batch, batchC = nil, nil
 		}
 		if (!spoke || r.Pending()) && !send() {
 			return

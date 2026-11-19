@@ -657,13 +657,18 @@ func (r *Runner) start(ti protocol.TaskItem) {
 		}
 	}
 	// While the session runs as another user, as said, a command that does
-	// not become says it runs as the login: before its ack.
+	// not become says it runs as the login: before its ack. A copy core
+	// sent again before it had the ack adds neither: they wait in order
+	// already, where the first came (the identity it says is for the tasks
+	// acked after it).
 	cmd := r.ops[ti.Cmd]
 	switching := cmd == CmdBecome || cmd == CmdUnbecome
-	if !switching && !becomes(cmd) && r.said != nil {
-		r.order = append(r.order, ownIdentity(protocol.IdentityTask, ti.Task))
+	if !r.ackWaitsLocked(ti.Task) {
+		if !switching && !becomes(cmd) && r.said != nil {
+			r.order = append(r.order, ownIdentity(protocol.IdentityTask, ti.Task))
+		}
+		r.order = append(r.order, ti.Task)
 	}
-	r.order = append(r.order, ti.Task)
 	if _, ran := r.seen[key]; ran {
 		r.mu.Unlock()
 		r.logf("task %s again: acked, not run again", key[:8])
@@ -731,12 +736,40 @@ func (r *Runner) reack(ids [][]byte, item int) {
 	defer r.mu.Unlock()
 	for _, id := range ids {
 		if slices.ContainsFunc(r.tasks, func(t *Task) bool { return slices.Equal(t.id, id) }) {
-			r.order = append(r.order, id)
+			if !r.ackWaitsLocked(id) {
+				r.order = append(r.order, id)
+			}
 			continue
 		}
 		r.errs = append(r.errs, protocol.ErrItem{T: protocol.ItemErr, Code: protocol.ErrItemUnknownTask,
 			Msg: "no such task: it ran in a connection that closed", Item: &item, Task: id})
 	}
+}
+
+// ackWaitsLocked: task's ack waits in order for the next message already.
+func (r *Runner) ackWaitsLocked(task []byte) bool {
+	return slices.ContainsFunc(r.order, func(o any) bool { id, ok := o.([]byte); return ok && slices.Equal(id, task) })
+}
+
+// StreamsPending reports whether the tunnels have items to send: what a
+// side message carries while the session's message waits for its reply
+// (agent's session).
+func (r *Runner) StreamsPending() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.tun.pending()
+}
+
+// StreamItems takes the tunnels' items for a side message: within a
+// message's room, nothing of the tasks', acks' or files' (those go in the
+// session's own messages, one at a time). Every one of them may go again
+// (offsets, windows, numbers): a side message whose reply never comes
+// needs nothing back; the streams send again from their acks.
+func (r *Runner) StreamItems() []any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	items, _ := r.tun.items(r.perMessageLocked(), tunnelMaxItems)
+	return items
 }
 
 // stop cancels a running task; one the runner does not have gets an

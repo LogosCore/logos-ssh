@@ -300,6 +300,14 @@ terminal, VPN) work as they do with BOB's minion.
 - **As the login**: a [become](#become) elevates shell tasks only. A
   terminal is the login's shell, and a forward is sshd's, as its
   `AllowTcpForwarding`, `PermitOpen` and `GatewayPorts` allow.
+- **Side messages**: the session sends its own messages one at a time, each
+  waiting for core's reply, but meanwhile the streams' items go in side
+  messages of their own, as many as there is to send (the streams' windows
+  bound the bytes), gathering what comes over 5 ms: a server's bytes never
+  wait for a reply to another message, which a channel far from core would
+  feel. They go once core answered the hello, under the session's id, and
+  carry no ack, result or `get_tasks`; one whose reply never comes needs
+  nothing back, as the streams send again from their acks.
 - **They end with the connection**: when the channel's connection to core
   drops, or the SSH connection does, every stream and listener closes. Core
   then gets `unknown_task` for the tunnel tasks, as it does for any task that

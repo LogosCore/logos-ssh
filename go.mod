@@ -8,7 +8,7 @@ require (
 	github.com/logoscore/logos-golang-channel-core/v3 v3.9.5
 	github.com/logoscore/logos-golang-factory-core v0.5.3
 	github.com/logoscore/logos-golang-module-core v0.3.5
-	github.com/logoscore/logos-golang-protocol v0.55.0
+	github.com/logoscore/logos-golang-protocol v0.57.0
 	github.com/pkg/sftp v1.13.12
 	golang.org/x/crypto v0.55.0
 	golang.org/x/net v0.58.0

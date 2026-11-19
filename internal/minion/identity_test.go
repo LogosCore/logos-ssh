@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -229,6 +230,29 @@ func TestRunnerAfterBecome(t *testing.T) {
 	seen := asCoreSees(t, "root", then)
 	if seen[hex.EncodeToString(taskID(2))] != "root" || seen[hex.EncodeToString(taskID(3))] != "" {
 		t.Fatalf("core records %v", seen)
+	}
+}
+
+// Copies of a task core sent again before it had the ack add no identity
+// and no ack: both wait in order where the first came. A reack of it adds
+// none either.
+func TestRunnerCopiesAddNothing(t *testing.T) {
+	h := newBecomeHost(0)
+	r := newRunnerWith(Config{Host: h}, CmdBecome, CmdLs)
+	runAll(t, r, becomeOf(1, "root", BecomeSudo))
+	ls := taskOf(2, CmdLs, protocol.Args{ArgLsPath: t.TempDir()})
+	for range 3 {
+		r.start(ls)
+	}
+	r.reack([][]byte{taskID(2)}, 0)
+	r.mu.Lock()
+	order := slices.Clone(r.order)
+	r.mu.Unlock()
+	if len(order) != 2 {
+		t.Fatalf("the order holds %d entries, not the ls's identity and its ack once: %v", len(order), order)
+	}
+	if id, ok := order[0].(protocol.IdentityItem); !ok || id.Scope != protocol.IdentityTask || !id.Own() {
+		t.Fatalf("first in order: %+v, not the ls's own identity", order[0])
 	}
 }
 

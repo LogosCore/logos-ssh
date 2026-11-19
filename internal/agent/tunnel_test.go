@@ -262,6 +262,88 @@ func TestSessionTunnel(t *testing.T) {
 	}, nil)
 }
 
+// While the session's own message waits for core's reply, a stream's bytes
+// back from the server go in side messages of their own, as many as there
+// are and none held back for that reply: no ack, result or get_tasks in
+// them.
+func TestSessionSideMessages(t *testing.T) {
+	srv := sshtest.New(t, t.TempDir())
+	cs, _ := openSession(t, srv)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(c, c)
+				_ = c.Close()
+			}()
+		}
+	}()
+	port := uint64(ln.Addr().(*net.TCPAddr).Port) //nolint:gosec // a port
+
+	task := bytes.Repeat([]byte{0x7}, 16)
+	cs.push(protocol.TaskItem{T: protocol.ItemTask, Task: task, Cmd: ops.Tunnel, Args: protocol.Args{}})
+	cs.until("ack of the tunnel task", acked(t, task), nil)
+	cs.push(protocol.TunnelItem{T: protocol.ItemTunnel, Task: task, Stream: 1, Host: "127.0.0.1", Port: port})
+	cs.until("the stream's open", func(raw []byte) bool {
+		return is(t, raw, protocol.ItemTunnelReply, func(r protocol.TunnelReplyItem) bool {
+			return r.Stream == 1 && r.Result == protocol.TunnelOpen
+		})
+	}, nil)
+
+	// The session's own message, left unanswered: a shell task's ack.
+	shell := bytes.Repeat([]byte{0x8}, 16)
+	cs.push(protocol.TaskItem{T: protocol.ItemTask, Task: shell, Cmd: ops.Shell, Args: protocol.Args{minion.ArgShellCommand: "sleep 1"}})
+	held := minionMessage(t, cs.core.next(t).Data)
+	heldAck := false
+	for _, raw := range held.Items {
+		heldAck = heldAck || acked(t, shell)(raw)
+	}
+	if !heldAck {
+		t.Fatalf("the session's message: %d item(s), not the shell's ack", len(held.Items))
+	}
+
+	// Bytes for the stream, a moment apart: their echoes come back in side
+	// messages while that message waits.
+	var want, got []byte
+	for k := range 6 {
+		data := []byte{'a' + byte(k)}
+		cs.push(protocol.TunnelDataItem{T: protocol.ItemTunnelData, Task: task, Stream: 1, Off: uint64(len(want)), Data: data})
+		want = append(want, data...)
+		time.Sleep(20 * time.Millisecond)
+	}
+	sides := 0
+	for deadline := time.Now().Add(5 * time.Second); len(got) < len(want) && time.Now().Before(deadline); {
+		m := minionMessage(t, cs.core.next(t).Data)
+		checkItems(t, m)
+		sides++
+		for _, raw := range m.Items {
+			switch protocol.ItemType(raw) {
+			case protocol.ItemTunnelData:
+				var d protocol.TunnelDataItem
+				if protocol.UnmarshalCBOR(raw, &d) == nil && d.Stream == 1 {
+					got = append(got, d.Data...)
+				}
+			case protocol.ItemAck, protocol.ItemResult, protocol.ItemGetTasks:
+				t.Fatalf("a side message carries item %d of the session's own", protocol.ItemType(raw))
+			}
+		}
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("the echoes: %q, not %q", got, want)
+	}
+	if sides < 2 {
+		t.Fatalf("%d side message(s): the echoes waited for one another", sides)
+	}
+}
+
 // A reverse tunnel: the server listens, says where (tunnel_listen), and a
 // connection to it is a stream the minion opens to core.
 func TestSessionReverseTunnel(t *testing.T) {

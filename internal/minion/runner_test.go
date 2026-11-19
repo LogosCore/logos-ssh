@@ -62,12 +62,22 @@ func TestTaskOnceAndUnknownCancel(t *testing.T) {
 	if task := waitEnd(t, r, 2*time.Second); !task.ok {
 		t.Fatalf("volumes: %+v", task)
 	}
+	// A copy before the ack went adds no ack; one after it, one again.
+	r.start(vols)
 	r.start(vols)
 	r.mu.Lock()
 	tasks, acks := len(r.tasks), len(queuedAcks(r))
 	r.mu.Unlock()
-	if tasks != 1 || acks != 2 {
-		t.Fatalf("tasks %d acks %d", tasks, acks)
+	if tasks != 1 || acks != 1 {
+		t.Fatalf("copies before the ack went: tasks %d acks %d", tasks, acks)
+	}
+	r.Outgoing()
+	r.start(vols)
+	r.mu.Lock()
+	tasks, acks = len(r.tasks), len(queuedAcks(r))
+	r.mu.Unlock()
+	if tasks != 1 || acks != 1 {
+		t.Fatalf("a copy after the ack went: tasks %d acks %d", tasks, acks)
 	}
 	other := make([]byte, 16)
 	other[0] = 9
