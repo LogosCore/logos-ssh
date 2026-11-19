@@ -5,9 +5,9 @@ go 1.25.7
 require (
 	github.com/fxamacker/cbor/v2 v2.9.6
 	github.com/joho/godotenv v1.5.1
-	github.com/logoscore/logos-golang-channel-core/v3 v3.9.5
-	github.com/logoscore/logos-golang-factory-core v0.5.3
-	github.com/logoscore/logos-golang-module-core v0.3.5
+	github.com/logoscore/logos-golang-channel-core/v3 v3.9.6
+	github.com/logoscore/logos-golang-factory-core v0.5.4
+	github.com/logoscore/logos-golang-module-core v0.3.6
 	github.com/logoscore/logos-golang-protocol v0.57.0
 	github.com/pkg/sftp v1.13.12
 	golang.org/x/crypto v0.55.0
